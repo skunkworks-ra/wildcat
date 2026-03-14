@@ -1,0 +1,17 @@
+[project]
+name = "wildcat"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.12,<3.13"
+pip = ">=24"
+
+[pypi-dependencies]
+wildcat = { path = ".", editable = true }
+
+[tasks]
+start = { cmd = "wildcat", description = "Start all wildcat services" }
+test  = { cmd = "pytest tests/ -v" }
+lint  = { cmd = "ruff check src/ tests/" }
+check = { cmd = "ruff check src/ tests/ && ruff format --check src/ tests/" }

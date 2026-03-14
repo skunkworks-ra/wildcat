@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>wildcat — workflow {{ workflow.id }}</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 2rem; max-width: 960px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; color: #7dd3fc; margin-bottom: 0.5rem; }
+    h2 { font-size: 1.1rem; color: #94a3b8; margin: 1.5rem 0 0.5rem; }
+    .badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; background: #1e3a5f; color: #7dd3fc; }
+    .badge.active { background: #14532d; color: #86efac; }
+    .badge.waiting { background: #78350f; color: #fde68a; }
+    .status-bar { background: #1e293b; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0; font-size: 0.9rem; }
+    .summary-box { background: #1e293b; border-left: 3px solid #7dd3fc; padding: 1rem 1.25rem; border-radius: 4px; line-height: 1.7; margin: 1rem 0; }
+    .waiting-box { background: #1e293b; border-left: 3px solid #f59e0b; padding: 1rem 1.25rem; border-radius: 4px; line-height: 1.7; margin: 1rem 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin: 0.5rem 0 1rem; }
+    th { text-align: left; color: #64748b; border-bottom: 1px solid #334155; padding: 0.4rem 0.5rem; }
+    td { padding: 0.4rem 0.5rem; border-bottom: 1px solid #1e293b; vertical-align: top; word-break: break-all; max-width: 480px; }
+    .decision-form { background: #1e293b; border-radius: 8px; padding: 1.5rem; margin-top: 2rem; }
+    textarea { width: 100%; background: #0f1117; color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; padding: 0.75rem; font-family: inherit; font-size: 0.9rem; resize: vertical; min-height: 80px; margin: 0.75rem 0 1rem; }
+    .btn-row { display: flex; gap: 1rem; }
+    button { flex: 1; padding: 0.75rem 1.5rem; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+    button:hover { opacity: 0.85; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-imaging { background: #0ea5e9; color: #fff; }
+    .btn-calibration { background: #f59e0b; color: #0f1117; }
+    #result { margin-top: 1rem; padding: 0.75rem; border-radius: 4px; font-weight: 600; display: none; }
+    .success { background: #14532d; color: #86efac; }
+    .error { background: #7f1d1d; color: #fca5a5; }
+    .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid #64748b; border-top-color: #7dd3fc; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<h1>wildcat</h1>
+<p>
+  <span class="badge">workflow {{ workflow.id }}</span>
+  &nbsp;
+  <span class="badge {% if workflow.stage == 'HUMAN_CHECKPOINT' %}waiting{% else %}active{% endif %}" id="stage-badge">{{ workflow.stage }}</span>
+  &nbsp;
+  <code style="color:#94a3b8; font-size:0.85rem;">{{ workflow.ms_path }}</code>
+</p>
+
+<!-- Live status bar — polls /status every 3s -->
+<div class="status-bar"
+     hx-get="/status/{{ workflow.id }}"
+     hx-trigger="every 3s"
+     hx-swap="innerHTML"
+     id="status-bar">
+  <span class="spinner"></span> Polling orchestrator…
+</div>
+
+{% if checkpoint %}
+<h2>LLM assessment</h2>
+<div class="summary-box">{{ checkpoint.llm_summary }}</div>
+
+{% if tool_outputs %}
+<h2>Key metrics</h2>
+<table>
+  <thead><tr><th>Tool</th><th>Output (truncated)</th></tr></thead>
+  <tbody>
+    {% for tool_name, data in tool_outputs.items() %}
+    <tr>
+      <td><strong>{{ tool_name }}</strong></td>
+      <td><code>{{ data | tojson | truncate(300) }}</code></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<div class="decision-form">
+  <h2 style="color:#e2e8f0; margin-top:0;">Your decision</h2>
+  <p style="color:#94a3b8; margin-bottom:0.75rem; font-size:0.9rem;">Choose the next pipeline path.</p>
+  <label for="notes" style="color:#94a3b8; font-size:0.9rem;">Notes (optional)</label>
+  <textarea id="notes" name="notes" placeholder="e.g. RFI in channels 50–80, flagged manually…"></textarea>
+  <div class="btn-row">
+    <button class="btn-imaging"
+      hx-post="/checkpoint/{{ workflow.id }}/decide"
+      hx-vals='{"route": "imaging"}'
+      hx-include="#notes"
+      hx-target="#result"
+      hx-on::after-request="onDecide(event)">
+      Proceed to imaging
+    </button>
+    <button class="btn-calibration"
+      hx-post="/checkpoint/{{ workflow.id }}/decide"
+      hx-vals='{"route": "calibration"}'
+      hx-include="#notes"
+      hx-target="#result"
+      hx-on::after-request="onDecide(event)">
+      Re-run calibration
+    </button>
+  </div>
+  <div id="result"></div>
+</div>
+
+{% else %}
+<div class="waiting-box">
+  <span class="spinner"></span>
+  Orchestrator is still running — this page will update automatically when the checkpoint is ready.
+</div>
+{% endif %}
+
+<script>
+function onDecide(event) {
+  const el = document.getElementById("result");
+  el.style.display = "block";
+  if (event.detail.successful) {
+    el.className = "success";
+    el.textContent = "Decision recorded — orchestrator resuming.";
+    document.querySelectorAll(".btn-row button").forEach(b => b.disabled = true);
+  } else {
+    el.className = "error";
+    el.textContent = "Error: " + event.detail.xhr.responseText;
+  }
+}
+</script>
+
+</body>
+</html>

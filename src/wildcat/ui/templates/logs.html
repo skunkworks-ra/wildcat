@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>wildcat — live log</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 2rem; max-width: 960px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; color: #7dd3fc; margin-bottom: 0.5rem; }
+    nav { margin-bottom: 1.5rem; font-size: 0.85rem; }
+    nav a { color: #64748b; text-decoration: none; }
+    nav a:hover { color: #7dd3fc; }
+    .controls { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.75rem; font-size: 0.85rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #86efac; display: inline-block; animation: pulse 1.5s ease-in-out infinite; }
+    .dot.dead { background: #f87171; animation: none; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    label { color: #64748b; display: flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+    #log {
+      background: #0a0d14;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      padding: 1rem;
+      height: 70vh;
+      overflow-y: auto;
+      font-family: ui-monospace, monospace;
+      font-size: 0.8rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .line { color: #94a3b8; }
+    .line.info    { color: #7dd3fc; }
+    .line.warning { color: #fde68a; }
+    .line.error   { color: #f87171; }
+    .line.stage   { color: #86efac; font-weight: 600; }
+    .line.llm     { color: #c4b5fd; }
+    .line.tool    { color: #fdba74; }
+  </style>
+</head>
+<body>
+
+<h1>wildcat</h1>
+<nav><a href="javascript:history.back()">← back</a></nav>
+
+<div class="controls">
+  <span class="dot" id="dot"></span>
+  <span id="status" style="color:#86efac">connected</span>
+  <label>
+    <input type="checkbox" id="autoscroll" checked>
+    auto-scroll
+  </label>
+</div>
+
+<div id="log"></div>
+
+<script>
+const log     = document.getElementById("log");
+const dot     = document.getElementById("dot");
+const status  = document.getElementById("status");
+const scroll  = document.getElementById("autoscroll");
+
+function classify(text) {
+  if (/\[ERROR\]/.test(text))                return "line error";
+  if (/\[WARNING\]/.test(text))              return "line warning";
+  if (/stage=Stage\.|stage=/.test(text))     return "line stage";
+  if (/llm|LLM|chat\/completions/.test(text)) return "line llm";
+  if (/Tool |tool_|HTTP Request/.test(text)) return "line tool";
+  if (/\[INFO\]/.test(text))                 return "line info";
+  return "line";
+}
+
+function append(text) {
+  const div = document.createElement("div");
+  div.className = classify(text);
+  div.textContent = text;
+  log.appendChild(div);
+  if (scroll.checked) {
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+const es = new EventSource("/logs/stream");
+
+es.onmessage = (e) => append(e.data);
+
+es.onerror = () => {
+  dot.className = "dot dead";
+  status.textContent = "disconnected — retrying…";
+  status.style.color = "#f87171";
+};
+
+es.onopen = () => {
+  dot.className = "dot";
+  status.textContent = "connected";
+  status.style.color = "#86efac";
+};
+</script>
+
+</body>
+</html>
