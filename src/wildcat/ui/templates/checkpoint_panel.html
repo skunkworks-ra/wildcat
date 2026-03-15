@@ -1,0 +1,195 @@
+{% if not checkpoint %}
+{# No checkpoint yet — keep polling. Server returns this WITH hx-trigger so HTMX keeps swapping. #}
+<div id="cp-panel"
+     hx-get="/checkpoint/{{ workflow_id }}/panel"
+     hx-trigger="every 3s"
+     hx-swap="outerHTML">
+  <p class="empty-notice" style="color:#7c3aed; padding:1rem 0;">
+    <span class="poll-dot" style="background:#7c3aed"></span>
+    Waiting for checkpoint…
+  </p>
+</div>
+
+{% elif already_decided %}
+{# Already decided — show confirmation, no form. Static, no polling. #}
+<div id="cp-panel">
+  <p style="color:#86efac; font-size:0.9rem; padding:0.75rem 0;">
+    ✓ Decision recorded — orchestrator resuming.
+  </p>
+</div>
+
+{% else %}
+{# Checkpoint ready with questions — stable form, NO hx-trigger. HTMX stops swapping here. #}
+<div id="cp-panel">
+
+<style>
+  .cp-section-title {
+    font-size: 0.7rem; font-weight: 700; letter-spacing: 0.12em;
+    text-transform: uppercase; color: #7c3aed;
+    margin-bottom: 0.75rem; padding-bottom: 0.4rem;
+    border-bottom: 1px solid #2d1b69;
+  }
+  .cp-summary {
+    font-size: 0.9rem; line-height: 1.6; color: #cbd5e1;
+    background: #131a27; border-left: 3px solid #7c3aed;
+    padding: 0.75rem 1rem; border-radius: 0 4px 4px 0;
+    margin-bottom: 1.5rem;
+  }
+  .q-card {
+    background: #131a27; border: 1px solid #1e293b;
+    border-radius: 6px; padding: 1.25rem 1.5rem; margin-bottom: 1rem;
+  }
+  .q-card.sev-critical { border-left: 3px solid #ef4444; }
+  .q-card.sev-warning  { border-left: 3px solid #f59e0b; }
+  .q-card.sev-info     { border-left: 3px solid #3b82f6; }
+  .q-meta { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.6rem; }
+  .q-sev {
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.08em;
+    padding: 0.15rem 0.45rem; border-radius: 3px;
+  }
+  .q-sev-critical { background: #7f1d1d; color: #fca5a5; }
+  .q-sev-warning  { background: #78350f; color: #fde68a; }
+  .q-sev-info     { background: #1e3a5f; color: #93c5fd; }
+  .q-id { font-family: ui-monospace, monospace; font-size: 0.75rem; color: #64748b; }
+  .q-finding { font-size: 0.85rem; color: #94a3b8; line-height: 1.55; margin-bottom: 0.75rem; }
+  .q-question { font-size: 0.95rem; font-weight: 600; color: #e2e8f0; margin-bottom: 0.85rem; }
+  .q-options { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+  .opt-btn {
+    padding: 0.45rem 1rem; border-radius: 5px;
+    border: 1.5px solid #334155; background: #0f1117;
+    color: #94a3b8; font-size: 0.85rem; font-weight: 600;
+    cursor: pointer; transition: all 0.12s;
+  }
+  .opt-btn:hover { border-color: #7dd3fc; color: #7dd3fc; }
+  .opt-btn.selected { border-color: #6366f1; background: #1e1b4b; color: #e2e8f0; }
+  .opt-btn[data-answer="exit"]      { border-color: #4b1a1a; color: #f87171; }
+  .opt-btn[data-answer="exit"].selected { background: #7f1d1d; border-color: #ef4444; color: #fca5a5; }
+  .opt-btn[data-answer="loop_back"] { border-color: #451a03; color: #fbbf24; }
+  .opt-btn[data-answer="loop_back"].selected { background: #78350f; border-color: #f59e0b; color: #fde68a; }
+  .opt-btn[data-answer="no"]        { border-color: #451a03; color: #fbbf24; }
+  .opt-btn[data-answer="no"].selected { background: #78350f; border-color: #f59e0b; color: #fde68a; }
+  .cp-notes { margin-top: 1.25rem; }
+  .cp-notes label { font-size: 0.8rem; color: #64748b; display: block; margin-bottom: 0.4rem; }
+  .cp-notes textarea {
+    width: 100%; background: #0f1117; color: #e2e8f0;
+    border: 1px solid #334155; border-radius: 4px;
+    padding: 0.6rem 0.75rem; font-family: inherit;
+    font-size: 0.85rem; resize: vertical; min-height: 64px;
+  }
+  .cp-submit {
+    margin-top: 1rem;
+    padding: 0.65rem 1.75rem; border: none; border-radius: 5px;
+    font-size: 0.95rem; font-weight: 600; cursor: pointer;
+    background: #6366f1; color: #fff; transition: opacity 0.15s;
+  }
+  .cp-submit:hover { opacity: 0.85; }
+  .cp-submit:disabled { opacity: 0.35; cursor: not-allowed; }
+  .cp-result { margin-top: 0.75rem; padding: 0.65rem 0.9rem; border-radius: 4px; font-size: 0.85rem; font-weight: 600; display: none; }
+  .cp-result.ok    { background: #064e3b; color: #6ee7b7; }
+  .cp-result.err   { background: #7f1d1d; color: #fca5a5; }
+</style>
+
+<h2 class="cp-section-title">
+  {% if checkpoint.stage == "CALIBRATION_CHECKPOINT" %}⬡ Calibration Review{% else %}⬡ Human Checkpoint{% endif %}
+</h2>
+
+{% if checkpoint.llm_summary %}
+<div class="cp-summary">{{ checkpoint.llm_summary }}</div>
+{% endif %}
+
+<form id="cp-form">
+  <input type="hidden" name="notes" value="">
+
+  {% for q in checkpoint_questions %}
+  {% set sev = q.severity | default('info') %}
+  <div class="q-card sev-{{ sev }}">
+    <div class="q-meta">
+      <span class="q-sev q-sev-{{ sev }}">{{ sev | upper }}</span>
+      <span class="q-id">{{ q.id }}</span>
+    </div>
+    <p class="q-finding">{{ q.finding }}</p>
+    <p class="q-question">{{ q.question }}</p>
+    <input type="hidden" name="answer_{{ q.id }}" id="ans-{{ q.id }}" value="">
+    <div class="q-options">
+      {% for opt in q.options %}
+      {% set labels = {
+        "continue_polcal": "Continue with polcal",
+        "stokes_i_only":   "Revert to Stokes I only",
+        "proceed":         "Accept & continue",
+        "loop_back":       "Re-run calibration",
+        "exit":            "Exit pipeline",
+        "yes":             "Yes",
+        "no":              "No"
+      } %}
+      <button type="button" class="opt-btn"
+              data-qid="{{ q.id }}"
+              data-answer="{{ opt }}"
+              onclick="cpSelect(this)">
+        {{ labels[opt] if opt in labels else opt | replace('_', ' ') | title }}
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+
+  <div class="cp-notes">
+    <label for="cp-notes-txt">Notes (optional)</label>
+    <textarea id="cp-notes-txt" placeholder="e.g. ea19 confirmed bad from previous session…"
+              oninput="document.querySelector('[name=notes]').value=this.value"></textarea>
+  </div>
+
+  <button type="button" class="cp-submit" id="cp-submit" disabled onclick="cpSubmit()">
+    Submit decision
+  </button>
+  <div class="cp-result" id="cp-result"></div>
+</form>
+
+<script>
+(function() {
+  const questionIds = {{ checkpoint_questions | map(attribute='id') | list | tojson | safe }};
+  const answered = {};
+
+  window.cpSelect = function(btn) {
+    const qid = btn.dataset.qid;
+    document.querySelectorAll('.opt-btn[data-qid="' + qid + '"]').forEach(b => b.classList.remove('selected'));
+    btn.classList.add('selected');
+    document.getElementById('ans-' + qid).value = btn.dataset.answer;
+    answered[qid] = btn.dataset.answer;
+    document.getElementById('cp-submit').disabled = !questionIds.every(id => answered[id]);
+  };
+
+  window.cpSubmit = async function() {
+    const form = document.getElementById('cp-form');
+    const btn  = document.getElementById('cp-submit');
+    const res  = document.getElementById('cp-result');
+    btn.disabled = true;
+    btn.textContent = 'Submitting…';
+    try {
+      const resp = await fetch('/checkpoint/{{ workflow_id }}/decide', {
+        method: 'POST', body: new FormData(form),
+      });
+      res.style.display = 'block';
+      if (resp.ok) {
+        const data = await resp.json();
+        res.className = 'cp-result ok';
+        res.textContent = '✓ Decision recorded (' + data.route + ') — orchestrator resuming.';
+        document.querySelectorAll('.opt-btn').forEach(b => b.disabled = true);
+      } else {
+        res.className = 'cp-result err';
+        res.textContent = 'Error: ' + await resp.text();
+        btn.disabled = false;
+        btn.textContent = 'Submit decision';
+      }
+    } catch(e) {
+      res.style.display = 'block';
+      res.className = 'cp-result err';
+      res.textContent = 'Network error: ' + e.message;
+      btn.disabled = false;
+      btn.textContent = 'Submit decision';
+    }
+  };
+})();
+</script>
+
+</div>
+{% endif %}

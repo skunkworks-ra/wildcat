@@ -22,7 +22,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from wildcat.state import StateDB
+from wildcat.orchestrator import _QUESTION_CONFIG_MAP
+from wildcat.state import Stage, StateDB
 
 log = logging.getLogger(__name__)
 
@@ -87,13 +88,41 @@ def build_ui_app(db: StateDB, checkpoint_event: asyncio.Event, stop_event: async
                 except (json.JSONDecodeError, KeyError):
                     tool_outputs[row["tool_name"]] = {"raw": row.get("output_json", "")}
 
+        # Extract checkpoint_questions from the last LLM decision
+        checkpoint_questions: list[dict] = []
+        last_dec_row = db.conn.execute(
+            "SELECT decision FROM llm_decisions WHERE workflow_id = ?"
+            " ORDER BY decided_at DESC LIMIT 1",
+            (workflow_id,),
+        ).fetchone()
+        if last_dec_row:
+            try:
+                last_dec = json.loads(last_dec_row["decision"])
+                checkpoint_questions = last_dec.get("checkpoint_questions") or []
+            except (json.JSONDecodeError, KeyError):
+                checkpoint_questions = []
+
+        # Collect plots from completed jobs
+        plots: list[str] = []
+        jobs = db.conn.execute(
+            "SELECT plots FROM jobs WHERE workflow_id = ? AND plots IS NOT NULL",
+            (workflow_id,),
+        ).fetchall()
+        for j in jobs:
+            try:
+                plots.extend(json.loads(j["plots"]) if j["plots"] else [])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         return templates.TemplateResponse(
             "checkpoint.html",
             {
-                "request":      request,
-                "workflow":     wf,
-                "checkpoint":   checkpoint,
-                "tool_outputs": tool_outputs,
+                "request":              request,
+                "workflow":             wf,
+                "checkpoint":           checkpoint,
+                "tool_outputs":         tool_outputs,
+                "checkpoint_questions": checkpoint_questions,
+                "plots":                plots,
             },
         )
 
@@ -118,19 +147,51 @@ def build_ui_app(db: StateDB, checkpoint_event: asyncio.Event, stop_event: async
             f"{reload}"
         )
 
-    @router.post("/checkpoint/{workflow_id}/decide")
-    async def decide(
-        workflow_id: int,
-        route: str = Form(...),
-        notes: str = Form(""),
-    ) -> dict:
-        """Record the human decision and unblock the orchestrator."""
-        if route not in ("imaging", "calibration"):
-            raise HTTPException(
-                status_code=422,
-                detail=f"Invalid route {route!r}. Must be 'imaging' or 'calibration'.",
-            )
+    @router.get("/checkpoint/{workflow_id}/panel", response_class=HTMLResponse)
+    async def checkpoint_panel(request: Request, workflow_id: int) -> HTMLResponse:
+        """Fragment for the pipeline monitor checkpoint section.
 
+        While no checkpoint exists, returns a polling div so HTMX keeps checking.
+        Once a checkpoint with questions is ready, returns a stable form div
+        WITHOUT hx-trigger — HTMX stops swapping and the form is safe to interact with.
+        """
+        checkpoint = db.get_latest_checkpoint(workflow_id)
+
+        # Pull checkpoint_questions from last LLM decision
+        checkpoint_questions: list[dict] = []
+        if checkpoint:
+            row = db.conn.execute(
+                "SELECT decision FROM llm_decisions WHERE workflow_id = ?"
+                " ORDER BY decided_at DESC LIMIT 1",
+                (workflow_id,),
+            ).fetchone()
+            if row:
+                try:
+                    checkpoint_questions = json.loads(row["decision"]).get("checkpoint_questions") or []
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+        already_decided = checkpoint and checkpoint.get("human_route") is not None
+
+        return templates.TemplateResponse(
+            "checkpoint_panel.html",
+            {
+                "request":              request,
+                "workflow_id":          workflow_id,
+                "checkpoint":           checkpoint,
+                "checkpoint_questions": checkpoint_questions,
+                "already_decided":      already_decided,
+            },
+        )
+
+    @router.post("/checkpoint/{workflow_id}/decide")
+    async def decide(request: Request, workflow_id: int) -> dict:
+        """Record human per-question answers and unblock the orchestrator.
+
+        Form fields:
+          notes            — optional free-text notes
+          answer_<id>      — one field per checkpoint question, e.g. answer_polcal=proceed
+        """
         checkpoint = db.get_latest_checkpoint(workflow_id)
         if checkpoint is None:
             raise HTTPException(
@@ -138,16 +199,60 @@ def build_ui_app(db: StateDB, checkpoint_event: asyncio.Event, stop_event: async
                 detail=f"No pending checkpoint for workflow {workflow_id}",
             )
 
-        db.resolve_checkpoint(checkpoint["id"], human_route=route, human_notes=notes)
+        form = await request.form()
+        notes: str = form.get("notes", "")  # type: ignore[assignment]
+
+        # Collect answers: {"polcal": "proceed", "aggressive_flagging": "yes", ...}
+        answers: dict[str, str] = {
+            key[len("answer_"):]: str(value)
+            for key, value in form.items()
+            if key.startswith("answer_")
+        }
+
+        # Route resolution (priority: exit > loop_back > proceed/yes/no)
+        # After HUMAN_CHECKPOINT approval: → CALIBRATION_PREFLAG (begin calibration)
+        # After CALIBRATION_CHECKPOINT approval: → IMAGING_PIPELINE
+        answer_values = set(answers.values())
+        checkpoint_stage = checkpoint.get("stage", "")
+        if "exit" in answer_values:
+            route = Stage.STOPPED.value
+        elif "loop_back" in answer_values:
+            route = Stage.CALIBRATION_LOOP.value
+        elif checkpoint_stage == Stage.HUMAN_CHECKPOINT.value:
+            route = Stage.CALIBRATION_PREFLAG.value
+        else:
+            route = Stage.IMAGING_PIPELINE.value
+
+        # Apply _QUESTION_CONFIG_MAP to derive config updates
+        try:
+            wf_config = db.get_workflow_config(workflow_id)
+        except KeyError:
+            wf_config = {"polcal": True, "aggressive_flagging": False}
+
+        for question_id, answer in answers.items():
+            mapping = _QUESTION_CONFIG_MAP.get(question_id, {})
+            update = mapping.get(answer)
+            if update is not None:
+                config_key, config_value = update
+                wf_config[config_key] = config_value
+
+        db.set_workflow_config(workflow_id, wf_config)
+
+        db.resolve_checkpoint(
+            checkpoint["id"],
+            human_route=route,
+            human_notes=notes,
+            question_answers=json.dumps(answers),
+        )
         log.info(
-            "Checkpoint %d resolved: route=%s workflow=%d",
-            checkpoint["id"], route, workflow_id,
+            "Checkpoint %d resolved: route=%s answers=%s workflow=%d",
+            checkpoint["id"], route, answers, workflow_id,
         )
 
         # Unblock the orchestrator
         checkpoint_event.set()
 
-        return {"status": "ok", "route": route}
+        return {"status": "ok", "route": route, "config": wf_config}
 
     @router.get("/logs", response_class=HTMLResponse)
     async def logs_page(request: Request) -> HTMLResponse:

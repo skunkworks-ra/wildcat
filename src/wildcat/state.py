@@ -7,6 +7,7 @@ logical unit — callers never write raw SQL.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from enum import Enum
@@ -14,27 +15,34 @@ from typing import Any
 
 
 class Stage(str, Enum):
-    IDLE             = "IDLE"
-    PHASE1_RUNNING   = "PHASE1_RUNNING"
-    PHASE1_COMPLETE  = "PHASE1_COMPLETE"
-    PHASE2_RUNNING   = "PHASE2_RUNNING"
-    PHASE2_COMPLETE  = "PHASE2_COMPLETE"
-    PHASE3_RUNNING   = "PHASE3_RUNNING"
-    PHASE3_COMPLETE  = "PHASE3_COMPLETE"
-    HUMAN_CHECKPOINT = "HUMAN_CHECKPOINT"
-    CALIBRATION_LOOP = "CALIBRATION_LOOP"
-    IMAGING_PIPELINE = "IMAGING_PIPELINE"
-    STOPPED          = "STOPPED"
-    ERROR            = "ERROR"
+    IDLE                    = "IDLE"
+    PHASE1_RUNNING          = "PHASE1_RUNNING"
+    PHASE1_COMPLETE         = "PHASE1_COMPLETE"
+    PHASE2_RUNNING          = "PHASE2_RUNNING"
+    PHASE2_COMPLETE         = "PHASE2_COMPLETE"
+    PHASE3_RUNNING          = "PHASE3_RUNNING"
+    PHASE3_COMPLETE         = "PHASE3_COMPLETE"
+    HUMAN_CHECKPOINT        = "HUMAN_CHECKPOINT"
+    CALIBRATION_PREFLAG     = "CALIBRATION_PREFLAG"
+    CALIBRATION_SOLVE       = "CALIBRATION_SOLVE"
+    CALIBRATION_APPLY       = "CALIBRATION_APPLY"
+    CALIBRATION_CHECKPOINT  = "CALIBRATION_CHECKPOINT"
+    CALIBRATION_LOOP        = "CALIBRATION_LOOP"
+    IMAGING_PIPELINE        = "IMAGING_PIPELINE"
+    STOPPED                 = "STOPPED"
+    ERROR                   = "ERROR"
 
+
+_WORKFLOW_CONFIG_DEFAULT = '{"polcal": true, "aggressive_flagging": false}'
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ms_path     TEXT NOT NULL,
-    stage       TEXT NOT NULL DEFAULT 'IDLE',
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ms_path         TEXT NOT NULL,
+    stage           TEXT NOT NULL DEFAULT 'IDLE',
+    workflow_config TEXT NOT NULL DEFAULT '{"polcal": true, "aggressive_flagging": false}',
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS tool_outputs (
@@ -61,14 +69,15 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE TABLE IF NOT EXISTS checkpoints (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow_id  INTEGER NOT NULL REFERENCES workflow(id),
-    stage        TEXT NOT NULL,
-    llm_summary  TEXT NOT NULL,
-    human_route  TEXT,
-    human_notes  TEXT,
-    presented_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    decided_at   DATETIME
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_id      INTEGER NOT NULL REFERENCES workflow(id),
+    stage            TEXT NOT NULL,
+    llm_summary      TEXT NOT NULL,
+    human_route      TEXT,
+    human_notes      TEXT,
+    question_answers TEXT,
+    presented_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    decided_at       DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS llm_decisions (
@@ -115,8 +124,17 @@ class StateDB:
         return self._conn
 
     def init_schema(self) -> None:
-        """Create all tables if they don't already exist."""
+        """Create all tables if they don't already exist, then migrate columns."""
         self.conn.executescript(_SCHEMA)
+        # Idempotent column migrations for existing databases
+        for stmt in (
+            f"ALTER TABLE workflow ADD COLUMN workflow_config TEXT NOT NULL DEFAULT '{_WORKFLOW_CONFIG_DEFAULT}'",
+            "ALTER TABLE checkpoints ADD COLUMN question_answers TEXT",
+        ):
+            try:
+                self.conn.execute(stmt)
+            except Exception:
+                pass  # column already exists
         self.conn.commit()
 
     # ── Workflow ──────────────────────────────────────────────────────────
@@ -136,6 +154,24 @@ class StateDB:
         if row is None:
             raise KeyError(f"No workflow with id={workflow_id}")
         return dict(row)
+
+    def get_workflow_config(self, workflow_id: int) -> dict:
+        """Return the workflow_config JSON blob as a dict (defaults applied)."""
+        row = self.conn.execute(
+            "SELECT workflow_config FROM workflow WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"No workflow with id={workflow_id}")
+        raw = row["workflow_config"] or _WORKFLOW_CONFIG_DEFAULT
+        return json.loads(raw)
+
+    def set_workflow_config(self, workflow_id: int, config: dict) -> None:
+        """Persist the workflow_config dict as JSON."""
+        self.conn.execute(
+            "UPDATE workflow SET workflow_config = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (json.dumps(config), workflow_id),
+        )
+        self.conn.commit()
 
     def transition(self, workflow_id: int, new_stage: Stage) -> None:
         self.conn.execute(
@@ -217,12 +253,16 @@ class StateDB:
         return dict(row) if row else None
 
     def resolve_checkpoint(
-        self, checkpoint_id: int, human_route: str, human_notes: str
+        self,
+        checkpoint_id: int,
+        human_route: str,
+        human_notes: str,
+        question_answers: str | None = None,
     ) -> None:
         self.conn.execute(
             "UPDATE checkpoints SET human_route = ?, human_notes = ?,"
-            " decided_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (human_route, human_notes, checkpoint_id),
+            " question_answers = ?, decided_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (human_route, human_notes, question_answers, checkpoint_id),
         )
         self.conn.commit()
 

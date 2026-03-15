@@ -166,6 +166,12 @@
 </div>
 {% endmacro %}
 
+{% if stage in ["HUMAN_CHECKPOINT", "CALIBRATION_CHECKPOINT"] %}
+<div style="background:#1e1b4b; border:1px solid #4338ca; border-radius:6px; padding:0.75rem 1rem; margin-bottom:1rem; font-size:0.875rem; color:#c7d2fe;">
+  ⬡ Pipeline paused — your decision is required below.
+</div>
+{% endif %}
+
 <!-- ── Workflow status bar ───────────────────────────────────────────── -->
 <div class="status-bar">
   <span class="stage-badge stage-{{ stage.lower() }}">{{ stage }}</span>

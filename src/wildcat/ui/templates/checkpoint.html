@@ -13,25 +13,89 @@
     .badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; background: #1e3a5f; color: #7dd3fc; }
     .badge.active { background: #14532d; color: #86efac; }
     .badge.waiting { background: #78350f; color: #fde68a; }
+    .badge.info { background: #1e3a5f; color: #7dd3fc; }
+    .badge.warning { background: #78350f; color: #fde68a; }
+    .badge.critical { background: #7f1d1d; color: #fca5a5; }
     .status-bar { background: #1e293b; border-radius: 6px; padding: 0.75rem 1rem; margin: 1rem 0; font-size: 0.9rem; }
     .summary-box { background: #1e293b; border-left: 3px solid #7dd3fc; padding: 1rem 1.25rem; border-radius: 4px; line-height: 1.7; margin: 1rem 0; }
     .waiting-box { background: #1e293b; border-left: 3px solid #f59e0b; padding: 1rem 1.25rem; border-radius: 4px; line-height: 1.7; margin: 1rem 0; }
-    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin: 0.5rem 0 1rem; }
-    th { text-align: left; color: #64748b; border-bottom: 1px solid #334155; padding: 0.4rem 0.5rem; }
-    td { padding: 0.4rem 0.5rem; border-bottom: 1px solid #1e293b; vertical-align: top; word-break: break-all; max-width: 480px; }
+
+    /* Question cards */
+    .question-card {
+      background: #1e293b;
+      border-radius: 8px;
+      padding: 1.25rem 1.5rem;
+      margin: 1rem 0;
+      border-left: 3px solid #334155;
+    }
+    .question-card.severity-warning { border-left-color: #f59e0b; }
+    .question-card.severity-critical { border-left-color: #ef4444; }
+    .question-card.severity-info    { border-left-color: #7dd3fc; }
+    .question-finding {
+      font-size: 0.9rem;
+      color: #cbd5e1;
+      margin: 0.5rem 0 0.75rem;
+      line-height: 1.6;
+    }
+    .question-text {
+      font-size: 1rem;
+      font-weight: 600;
+      color: #e2e8f0;
+      margin-bottom: 0.75rem;
+    }
+    .option-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    .option-btn {
+      padding: 0.5rem 1.1rem;
+      border: 2px solid #334155;
+      border-radius: 6px;
+      background: #0f1117;
+      color: #94a3b8;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .option-btn:hover { border-color: #7dd3fc; color: #7dd3fc; }
+    .option-btn.selected { border-color: #0ea5e9; background: #0c4a6e; color: #e2e8f0; }
+    .option-btn[data-answer="exit"] { border-color: #4b1a1a; color: #f87171; }
+    .option-btn[data-answer="exit"].selected { background: #7f1d1d; border-color: #ef4444; color: #fca5a5; }
+    .option-btn[data-answer="loop_back"] { border-color: #451a03; color: #fbbf24; }
+    .option-btn[data-answer="loop_back"].selected { background: #78350f; border-color: #f59e0b; color: #fde68a; }
+
+    /* Submit area */
     .decision-form { background: #1e293b; border-radius: 8px; padding: 1.5rem; margin-top: 2rem; }
     textarea { width: 100%; background: #0f1117; color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; padding: 0.75rem; font-family: inherit; font-size: 0.9rem; resize: vertical; min-height: 80px; margin: 0.75rem 0 1rem; }
+    .submit-btn {
+      padding: 0.75rem 2rem;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: #0ea5e9;
+      color: #fff;
+      transition: opacity 0.15s;
+    }
+    .submit-btn:hover { opacity: 0.85; }
+    .submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Fallback two-button row (shown when no checkpoint_questions) */
     .btn-row { display: flex; gap: 1rem; }
-    button { flex: 1; padding: 0.75rem 1.5rem; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+    button.btn-imaging { flex: 1; padding: 0.75rem 1.5rem; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; background: #0ea5e9; color: #fff; transition: opacity 0.15s; }
+    button.btn-calibration { flex: 1; padding: 0.75rem 1.5rem; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; background: #f59e0b; color: #0f1117; transition: opacity 0.15s; }
     button:hover { opacity: 0.85; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-imaging { background: #0ea5e9; color: #fff; }
-    .btn-calibration { background: #f59e0b; color: #0f1117; }
+
     #result { margin-top: 1rem; padding: 0.75rem; border-radius: 4px; font-weight: 600; display: none; }
     .success { background: #14532d; color: #86efac; }
     .error { background: #7f1d1d; color: #fca5a5; }
     .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid #64748b; border-top-color: #7dd3fc; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Plot thumbnails */
+    .plots-grid { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.75rem 0 1rem; }
+    .plots-grid a img { width: 180px; height: 120px; object-fit: cover; border-radius: 4px; border: 1px solid #334155; display: block; }
+    .plots-grid a img:hover { border-color: #7dd3fc; }
   </style>
 </head>
 <body>
@@ -58,21 +122,57 @@
 <h2>LLM assessment</h2>
 <div class="summary-box">{{ checkpoint.llm_summary }}</div>
 
-{% if tool_outputs %}
-<h2>Key metrics</h2>
-<table>
-  <thead><tr><th>Tool</th><th>Output (truncated)</th></tr></thead>
-  <tbody>
-    {% for tool_name, data in tool_outputs.items() %}
-    <tr>
-      <td><strong>{{ tool_name }}</strong></td>
-      <td><code>{{ data | tojson | truncate(300) }}</code></td>
-    </tr>
-    {% endfor %}
-  </tbody>
-</table>
+{% if plots %}
+<h2>Pipeline plots</h2>
+<div class="plots-grid">
+  {% for plot_path in plots %}
+  <a href="/jobs/{{ plot_path }}" target="_blank" title="{{ plot_path }}">
+    <img src="/jobs/{{ plot_path }}" alt="{{ plot_path }}" loading="lazy">
+  </a>
+  {% endfor %}
+</div>
 {% endif %}
 
+{% if checkpoint_questions %}
+<!-- Structured question cards -->
+<h2>Review findings</h2>
+<form id="decision-form">
+  {% for q in checkpoint_questions %}
+  <div class="question-card severity-{{ q.severity | default('info') }}">
+    <div>
+      <span class="badge {{ q.severity | default('info') }}">{{ q.severity | default('info') | upper }}</span>
+      &nbsp;<strong style="font-size:0.9rem; color:#94a3b8;">{{ q.id }}</strong>
+    </div>
+    <p class="question-finding">{{ q.finding }}</p>
+    <p class="question-text">{{ q.question }}</p>
+    <input type="hidden" name="answer_{{ q.id }}" id="ans-{{ q.id }}" value="">
+    <div class="option-row">
+      {% for opt in q.options %}
+      <button type="button"
+              class="option-btn"
+              data-qid="{{ q.id }}"
+              data-answer="{{ opt }}"
+              onclick="selectOption(this)">
+        {{ opt | replace('_', ' ') | title }}
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+
+  <div class="decision-form" style="margin-top:1.5rem;">
+    <label for="notes" style="color:#94a3b8; font-size:0.9rem;">Notes (optional)</label>
+    <textarea id="notes" name="notes" placeholder="e.g. RFI in channels 50–80, flagged manually…"></textarea>
+    <button type="button" class="submit-btn" id="submit-btn"
+            onclick="submitDecision()"
+            disabled>
+      Submit decision
+    </button>
+  </div>
+</form>
+
+{% else %}
+<!-- Fallback: no structured questions — show two hard-coded buttons -->
 <div class="decision-form">
   <h2 style="color:#e2e8f0; margin-top:0;">Your decision</h2>
   <p style="color:#94a3b8; margin-bottom:0.75rem; font-size:0.9rem;">Choose the next pipeline path.</p>
@@ -81,7 +181,7 @@
   <div class="btn-row">
     <button class="btn-imaging"
       hx-post="/checkpoint/{{ workflow.id }}/decide"
-      hx-vals='{"route": "imaging"}'
+      hx-vals='{"answer_route": "imaging"}'
       hx-include="#notes"
       hx-target="#result"
       hx-on::after-request="onDecide(event)">
@@ -89,15 +189,17 @@
     </button>
     <button class="btn-calibration"
       hx-post="/checkpoint/{{ workflow.id }}/decide"
-      hx-vals='{"route": "calibration"}'
+      hx-vals='{"answer_route": "calibration"}'
       hx-include="#notes"
       hx-target="#result"
       hx-on::after-request="onDecide(event)">
       Re-run calibration
     </button>
   </div>
-  <div id="result"></div>
 </div>
+{% endif %}
+
+<div id="result"></div>
 
 {% else %}
 <div class="waiting-box">
@@ -107,6 +209,67 @@
 {% endif %}
 
 <script>
+// Track which questions have been answered
+const questionIds = {{ checkpoint_questions | map(attribute='id') | list | tojson }};
+const answered = {};
+
+function selectOption(btn) {
+  const qid = btn.dataset.qid;
+  const answer = btn.dataset.answer;
+
+  // Deselect siblings
+  document.querySelectorAll(`.option-btn[data-qid="${qid}"]`).forEach(b => b.classList.remove('selected'));
+  btn.classList.add('selected');
+
+  // Update hidden input
+  document.getElementById(`ans-${qid}`).value = answer;
+  answered[qid] = answer;
+
+  // Enable submit when all questions answered
+  const submitBtn = document.getElementById('submit-btn');
+  if (submitBtn) {
+    const allAnswered = questionIds.every(id => answered[id]);
+    submitBtn.disabled = !allAnswered;
+  }
+}
+
+async function submitDecision() {
+  const form = document.getElementById('decision-form');
+  const data = new FormData(form);
+  const btn = document.getElementById('submit-btn');
+  btn.disabled = true;
+  btn.textContent = 'Submitting…';
+
+  try {
+    const resp = await fetch('/checkpoint/{{ workflow.id }}/decide', {
+      method: 'POST',
+      body: data,
+    });
+    const result = document.getElementById('result');
+    result.style.display = 'block';
+    if (resp.ok) {
+      const json = await resp.json();
+      result.className = 'success';
+      result.textContent = `Decision recorded (${json.route}) — orchestrator resuming.`;
+      document.querySelectorAll('.option-btn').forEach(b => b.disabled = true);
+    } else {
+      const text = await resp.text();
+      result.className = 'error';
+      result.textContent = 'Error: ' + text;
+      btn.disabled = false;
+      btn.textContent = 'Submit decision';
+    }
+  } catch (e) {
+    const result = document.getElementById('result');
+    result.style.display = 'block';
+    result.className = 'error';
+    result.textContent = 'Network error: ' + e.message;
+    btn.disabled = false;
+    btn.textContent = 'Submit decision';
+  }
+}
+
+// Legacy two-button handler
 function onDecide(event) {
   const el = document.getElementById("result");
   el.style.display = "block";

@@ -280,7 +280,6 @@
 <div class="subtitle">workflow #{{ workflow.id }} · {{ workflow.ms_path }}</div>
 
 <nav>
-  <a href="/checkpoint/{{ workflow.id }}">checkpoint</a>
   <a href="/logs">logs</a>
 </nav>
 
@@ -291,6 +290,13 @@
   <p style="color:#64748b; font-size:0.85rem">
     <span class="poll-dot"></span>Loading pipeline data…
   </p>
+</div>
+
+<!-- Checkpoint panel — polls until ready, then locks in place (no further swapping) -->
+<div id="cp-panel"
+     hx-get="/checkpoint/{{ workflow.id }}/panel"
+     hx-trigger="load, every 3s"
+     hx-swap="outerHTML">
 </div>
 
 </body>
