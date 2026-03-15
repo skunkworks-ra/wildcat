@@ -1,8 +1,8 @@
 # wildcat — Design Document
 ## Agentic Radio Interferometry Reduction Pipeline
 
-**Status:** Working — Phase 1 end-to-end verified, pipeline UI live
-**Last revised:** 2026-03-15 (rev 3)
+**Status:** Working — Phase 1-2 end-to-end verified, calibration pipeline staged
+**Last revised:** 2026-03-15 (rev 4)
 **Scope:** Orchestration layer. Phases 1–3 inspection + human checkpoint routing.
 
 ---
@@ -59,13 +59,37 @@ handoff to the human — and back — as frictionless as possible.
 ### 2.1 Workflow State Machine
 
 ```
-IDLE → PHASE1_RUNNING → HUMAN_CHECKPOINT → IMAGING_PIPELINE
-                                         → CALIBRATION_LOOP
+IDLE → PHASE1_RUNNING → PHASE2_RUNNING → PHASE3_RUNNING → HUMAN_CHECKPOINT
+                                                               │
+                                              (human approves) │
+                                                               ▼
+                                              CALIBRATION_PREFLAG ◄──────────┐
+                                                       │ rflag calibrators    │
+                                                       │ (max 3 iterations)   │
+                                                       ▼                      │
+                                              CALIBRATION_SOLVE               │
+                                                       │ delay+BP+gain        │
+                                                       │ flag BP caltable     │
+                                                       │ emit WILDCAT_METRICS │
+                                                       ▼                      │
+                                              CALIBRATION_APPLY               │
+                                                       │ applycal             │
+                                                       │ rflag corrected      │
+                                                       │ flag target          │
+                                                       ▼                      │
+                                         CALIBRATION_CHECKPOINT               │
+                                              │            │                  │
+                                   (approve) │            │ (loop_back) ──────┘
+                                              ▼            ▼
+                                    IMAGING_PIPELINE    CALIBRATION_LOOP
+                                                             │
+                                                             └──► CALIBRATION_PREFLAG (restart)
 ```
 
-Phases 2 and 3 are implemented but Phase 1 currently transitions directly
-to HUMAN_CHECKPOINT (LLM decision). Phases 2/3 will be wired once Phase 1
-checkpoint UI is validated end-to-end.
+The LLM is the orchestrator at every calibration stage — it reads
+`WILDCAT_METRICS` from CASA stdout and decides whether to loop or advance.
+The orchestrator enforces a 3-iteration cap on `CALIBRATION_PREFLAG` and
+escalates to `CALIBRATION_CHECKPOINT` if data remains heavily flagged.
 
 ### 2.2 MCP Tool Groups
 
@@ -123,7 +147,7 @@ HTMX polling (1s) of `/pipeline/{id}/fragment`. Renders:
   orchestrator checks at phase boundaries (before tools, before LLM, before CASA).
   Transitions to `STOPPED` stage on next safe boundary.
 
-### 4.3 Human Checkpoint — Structured Questions (planned, rev 3)
+### 4.3 Human Checkpoint — Structured Questions (rev 4)
 
 **Problem:** The current checkpoint presents two hard-coded buttons (imaging /
 calibration) with no scientific context. This is too blunt for domain experts.
@@ -226,20 +250,27 @@ under CASA Jobs. The LLM may reference specific plot filenames in its
 ### Working
 - Container builds successfully (llama.cpp + CUDA 12.6, sm_86)
 - ms-inspect starts via supervisord, serves all 20 tools over SSE
-- Phase 1 tools run against 3C129_1.ms — all 6 tools return valid JSON
-- LLM (Qwen3.5-4B Q4_K_XL, RTX 3080 Laptop) receives Phase 1 output and
-  produces structured JSON decision
-- Workflow transitions to HUMAN_CHECKPOINT and is recorded in SQLite
-- Pipeline monitor at `/pipeline/{id}` — structured tool cards, LLM decision,
-  stop button — live and verified against workflow 17
-- Log stream replays last 500 lines on connect (no longer empty on open)
-- Cooperative stop mechanism via `stop_event` — checks at 3 orchestrator boundaries
+- Phase 1 and 2 tools verified against 3C129_1.ms
+- LLM (Qwen3.5-4B Q4_K_XL, RTX 3080 Laptop) produces structured JSON decisions
+- Workflow transitions through inspection phases to HUMAN_CHECKPOINT
+- Structured checkpoint UI — per-question cards with data-driven findings,
+  polcal and aggressive_flagging decisions captured in workflow_config
+- Pipeline monitor at `/pipeline/{id}` — one page: tool cards, LLM decisions,
+  CASA jobs, and checkpoint form in a single HTMX-polled view
+- Checkpoint panel uses outerHTML swap trick to lock the form once the
+  questions arrive (polling stops, form is stable and clickable)
+- Calibration pipeline staged: CALIBRATION_PREFLAG → CALIBRATION_SOLVE →
+  CALIBRATION_APPLY → CALIBRATION_CHECKPOINT — LLM routes autonomously via
+  WILDCAT_METRICS; 3-iteration preflag cap enforced in orchestrator
+- CASA script templates with deterministic sections (solint from scan
+  durations, flagcal on BP caltable, rflag, metrics) and LLM-filled
+  placeholders (field names, refant, flux standard)
 
 ### Open / Next
-- **Checkpoint structured questions** (§4.3 design) — not yet implemented
-- Phase 2 and 3 tool calls untested end-to-end
-- CASA runner untested (no CASA in container yet)
-- `/pipeline/{id}` link not surfaced in checkpoint or logs nav
+- End-to-end calibration test (CASA not yet in container)
+- CALIBRATION_CHECKPOINT UI validation with real bp/gain metrics
+- Imaging script generation post-calibration
+- Phase 3 tool calls untested end-to-end
 
 ---
 
