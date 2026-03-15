@@ -1,8 +1,8 @@
 # wildcat — Design Document
 ## Agentic Radio Interferometry Reduction Pipeline
 
-**Status:** Working — Phase 1 end-to-end verified
-**Last revised:** 2026-03-14 (rev 2)
+**Status:** Working — Phase 1 end-to-end verified, pipeline UI live
+**Last revised:** 2026-03-15 (rev 3)
 **Scope:** Orchestration layer. Phases 1–3 inspection + human checkpoint routing.
 
 ---
@@ -99,7 +99,129 @@ static binary resolves it at runtime from the CDI-injected driver.
 
 ---
 
-## 4. Current Status (2026-03-14)
+## 4. UI Layer
+
+### 4.1 Pages
+
+| Route | Purpose |
+|-------|---------|
+| `/pipeline/{id}` | Live pipeline transparency monitor — tool outputs, LLM decisions, CASA artifacts |
+| `/checkpoint/{id}` | Human checkpoint — structured questions, route decision |
+| `/logs` | Raw log stream (SSE tail of `/var/log/wildcat.log`) |
+
+### 4.2 Pipeline Monitor (`/pipeline/{id}`)
+
+HTMX polling (1s) of `/pipeline/{id}/fragment`. Renders:
+- **MCP Tool Calls** — per-phase cards with structured field extraction from the
+  `{value, flag}` ms-inspect envelope. Per-tool renderers: field chips
+  (ms_field_list), scan table (ms_scan_list), SPW table (ms_spectral_window_list),
+  intent bar chart (ms_scan_intent_summary), generic KV table fallback.
+- **LLM Decisions** — summary (primary), reasoning trace (collapsible), next_stage
+  badge, CASA script (collapsible).
+- **CASA Jobs & Artifacts** — job status badges, plot thumbnails, stdout/stderr.
+- **Stop pipeline** button — cooperative cancellation via `stop_event` asyncio.Event;
+  orchestrator checks at phase boundaries (before tools, before LLM, before CASA).
+  Transitions to `STOPPED` stage on next safe boundary.
+
+### 4.3 Human Checkpoint — Structured Questions (planned, rev 3)
+
+**Problem:** The current checkpoint presents two hard-coded buttons (imaging /
+calibration) with no scientific context. This is too blunt for domain experts.
+
+**Design:**
+
+The LLM emits a `checkpoint_questions` array when `next_stage == HUMAN_CHECKPOINT`,
+as part of its existing Phase N decision JSON. No second LLM call (empirical
+first — may add dedicated checkpoint reasoning call later if same-call quality
+is poor).
+
+```json
+"checkpoint_questions": [
+  {
+    "id": "polcal",
+    "finding": "PA coverage is 45° — below the 90° threshold for reliable polarization calibration.",
+    "severity": "warning",
+    "question": "Proceed without polarization calibration?",
+    "options": ["proceed", "loop_back", "exit"]
+  },
+  {
+    "id": "aggressive_flagging",
+    "finding": "3 scans show elevated RFI in spw 4-6.",
+    "severity": "info",
+    "question": "Apply aggressive flagging before calibration?",
+    "options": ["yes", "no"]
+  }
+]
+```
+
+Options always include `exit` as a valid escape hatch.
+
+**Route resolution (orchestrator-side, deterministic):**
+
+| answers contain | route |
+|----------------|-------|
+| any `exit` | → `STOPPED` |
+| any `loop_back` | → `CALIBRATION_LOOP` |
+| all `proceed` / `yes` / `no` | → `IMAGING_PIPELINE` |
+
+Priority: exit > loop_back > proceed.
+
+**Config mapping (fixed rule table in orchestrator, not LLM-generated):**
+
+The tiny model (Qwen3.5-4B) is not asked to emit config key/value mappings —
+that is fragile schema generation. Instead a static table in the orchestrator
+maps `(question_id, answer) → (config_key, value)`:
+
+```python
+_QUESTION_CONFIG_MAP = {
+    "polcal":              {"proceed": ("polcal", False),           "loop_back": None, "exit": None},
+    "aggressive_flagging": {"yes":     ("aggressive_flagging", True), "no": ("aggressive_flagging", False)},
+}
+```
+
+**Workflow config state:**
+
+A `workflow_config` JSON column on the `workflow` table carries human decisions
+forward. Defaults are source-agnostic pipeline defaults:
+
+```json
+{
+  "polcal": true,
+  "aggressive_flagging": false
+}
+```
+
+This blob is injected into every subsequent LLM prompt (Phase 2+) so the model
+knows what the human has decided and adjusts tool selection and recommendations
+accordingly.
+
+**DB changes:**
+- `workflow.workflow_config TEXT` — JSON blob, written at workflow creation,
+  updated after each checkpoint resolution.
+- `checkpoints.question_answers TEXT` — JSON blob recording human answer per
+  question_id for audit trail.
+
+**What changes per file:**
+
+| File | Change |
+|------|--------|
+| `state.py` | `workflow_config` column; `get/set_workflow_config()` methods |
+| `orchestrator.py` | Inject config into LLM prompts; parse `checkpoint_questions`; apply `_QUESTION_CONFIG_MAP`; resolve route from answers |
+| `_DECISION_SCHEMA_KEYS` | `checkpoint_questions` added as optional key |
+| `_JSON_INSTRUCTION` | Document new schema to LLM |
+| `ui/app.py` | `POST /checkpoint/{id}/decide` accepts per-question answers, resolves route, writes config |
+| `templates/checkpoint.html` | Question cards with option buttons; plot display |
+
+### 4.4 Plots in checkpoint UI
+
+The checkpoint page renders plot thumbnails inline (from `jobs.plots`) with
+LLM-provided captions where available. The pipeline monitor also shows them
+under CASA Jobs. The LLM may reference specific plot filenames in its
+`checkpoint_questions` findings to direct the human's attention.
+
+---
+
+## 5. Current Status (2026-03-15)
 
 ### Working
 - Container builds successfully (llama.cpp + CUDA 12.6, sm_86)
@@ -108,19 +230,20 @@ static binary resolves it at runtime from the CDI-injected driver.
 - LLM (Qwen3.5-4B Q4_K_XL, RTX 3080 Laptop) receives Phase 1 output and
   produces structured JSON decision
 - Workflow transitions to HUMAN_CHECKPOINT and is recorded in SQLite
-- Checkpoint UI serves on :8081
+- Pipeline monitor at `/pipeline/{id}` — structured tool cards, LLM decision,
+  stop button — live and verified against workflow 17
+- Log stream replays last 500 lines on connect (no longer empty on open)
+- Cooperative stop mechanism via `stop_event` — checks at 3 orchestrator boundaries
 
 ### Open / Next
-- Checkpoint row not yet written before llama-server exits (second LLM call
-  removed — fix deployed, needs retest after rebuild)
-- Checkpoint UI untested end-to-end (POST /decide not yet exercised)
-- Phase 2 and 3 tool calls untested
-- run.sh tool smoke test steps produce no output (silent — needs debug)
+- **Checkpoint structured questions** (§4.3 design) — not yet implemented
+- Phase 2 and 3 tool calls untested end-to-end
 - CASA runner untested (no CASA in container yet)
+- `/pipeline/{id}` link not surfaced in checkpoint or logs nav
 
 ---
 
-## 5. Known Issues / Resolved
+## 6. Known Issues / Resolved
 
 | Issue | Resolution |
 |-------|-----------|

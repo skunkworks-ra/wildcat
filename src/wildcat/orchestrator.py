@@ -51,6 +51,7 @@ class Orchestrator:
         skills_path: str,
         runner: CASARunner,
         checkpoint_event: asyncio.Event,
+        stop_event: asyncio.Event | None = None,
     ) -> None:
         self.db = db
         self.tools = tools
@@ -58,6 +59,7 @@ class Orchestrator:
         self.skills_path = skills_path
         self.runner = runner
         self.checkpoint_event = checkpoint_event
+        self.stop_event = stop_event or asyncio.Event()
 
     # ── Main loop ──────────────────────────────────────────────────────────
 
@@ -91,6 +93,10 @@ class Orchestrator:
                 log.info("Workflow %d reached %s — handoff complete", workflow_id, stage)
                 break
 
+            elif stage == Stage.STOPPED:
+                log.info("Workflow %d stopped by user request", workflow_id)
+                break
+
             elif stage == Stage.ERROR:
                 log.error("Workflow %d is in ERROR state — manual intervention required", workflow_id)
                 break
@@ -116,6 +122,12 @@ class Orchestrator:
         ms_path: str = wf["ms_path"]
         stage = Stage(wf["stage"])
 
+        # 0. Check for stop before starting any work
+        if self.stop_event.is_set():
+            log.info("Stop requested — halting before Phase %d tools", phase)
+            self.db.transition(workflow_id, Stage.STOPPED)
+            return
+
         # 1. Call MCP tools
         log.info("Running Phase %d tools on %s", phase, ms_path)
         runner_map = {1: self.tools.run_phase1, 2: self.tools.run_phase2, 3: self.tools.run_phase3}
@@ -136,7 +148,11 @@ class Orchestrator:
             {"role": "user",   "content": user_content},
         ]
 
-        # 4. LLM decision
+        # 4. LLM decision — check for stop before invoking LLM
+        if self.stop_event.is_set():
+            log.info("Stop requested — halting before LLM call in Phase %d", phase)
+            self.db.transition(workflow_id, Stage.STOPPED)
+            return
         response = await self.llm.complete(messages)
         raw_decision = self._extract_content(response)
         decision = self._parse_decision(raw_decision)
@@ -148,8 +164,12 @@ class Orchestrator:
             workflow_id, stage.value, json.dumps(decision), model, prompt_hash
         )
 
-        # 6. Optional CASA job
+        # 6. Optional CASA job — check for stop before launching subprocess
         if decision.get("casa_script"):
+            if self.stop_event.is_set():
+                log.info("Stop requested — skipping CASA job in Phase %d", phase)
+                self.db.transition(workflow_id, Stage.STOPPED)
+                return
             await self._run_casa_job(workflow_id, stage.value, decision["casa_script"])
 
         # 7. Transition to the next stage from the LLM decision

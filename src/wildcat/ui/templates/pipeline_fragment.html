@@ -1,0 +1,313 @@
+{% set stage = workflow.stage %}
+{% set is_running = stage in ["PHASE1_RUNNING", "PHASE2_RUNNING", "PHASE3_RUNNING"] %}
+{% set is_stopped = stage == "STOPPED" %}
+{% set is_terminal = stage in ["STOPPED", "IMAGING_PIPELINE", "CALIBRATION_LOOP", "ERROR", "HUMAN_CHECKPOINT"] %}
+
+{# ── Macro: render one tool's data dict as structured key-value rows ── #}
+{% macro render_tool_data(data) %}
+{% for key, val in data.items() %}
+  {% if key in ["tool", "ms_path", "provenance", "casa_calls"] %}
+    {# skip internal / provenance fields #}
+  {% elif val is mapping and val.keys() | list | sort == ["flag", "value"] %}
+    {# {value, flag} envelope — the standard ms-inspect field shape #}
+    {% if val.flag == "COMPLETE" %}
+    <tr>
+      <td class="kv-key">{{ key | replace("_", " ") }}</td>
+      <td class="kv-val">
+        {% if val.value is iterable and val.value is not string %}
+          {{ val.value | join(", ") }}
+        {% else %}
+          {{ val.value if val.value is not none else "—" }}
+        {% endif %}
+      </td>
+      <td class="kv-flag flag-complete">✓</td>
+    </tr>
+    {% else %}
+    <tr class="kv-unavail">
+      <td class="kv-key">{{ key | replace("_", " ") }}</td>
+      <td class="kv-val">unavailable</td>
+      <td class="kv-flag flag-unavail">—</td>
+    </tr>
+    {% endif %}
+  {% elif val is mapping and "flag" not in val %}
+    {# nested dict without flag — recurse into it #}
+    {{ render_tool_data(val) }}
+  {% elif val is iterable and val is not string and val is not mapping %}
+    {# plain list #}
+    <tr>
+      <td class="kv-key">{{ key | replace("_", " ") }}</td>
+      <td class="kv-val" colspan="2">{{ val | join(", ") if val else "—" }}</td>
+    </tr>
+  {% elif val is not mapping %}
+    {# plain scalar #}
+    <tr>
+      <td class="kv-key">{{ key | replace("_", " ") }}</td>
+      <td class="kv-val" colspan="2">{{ val if val is not none else "—" }}</td>
+    </tr>
+  {% endif %}
+{% endfor %}
+{% endmacro %}
+
+{# ── Macro: render fields list (array of objects) summarised ─────────── #}
+{% macro render_fields_list(fields) %}
+<div class="fields-list">
+{% for f in fields %}
+  <div class="field-chip">
+    <span class="fc-name">{{ f.name }}</span>
+    {% if f.ra_hms %}<span class="fc-coord">{{ f.ra_hms }} {{ f.dec_dms }}</span>{% endif %}
+    {% if f.intents and f.intents.flag == "COMPLETE" %}
+      {% for intent in f.intents.value %}
+      <span class="fc-intent">{{ intent }}</span>
+      {% endfor %}
+    {% endif %}
+    {% if f.calibrator_match and f.calibrator_match.flag == "COMPLETE" %}
+    <span class="fc-cal">cal: {{ f.calibrator_match.value }}</span>
+    {% endif %}
+  </div>
+{% endfor %}
+</div>
+{% endmacro %}
+
+{# ── Macro: render scan list summarised ─────────────────────────────── #}
+{% macro render_scans(scans) %}
+<table class="scan-table">
+  <thead><tr>
+    <th>scan</th><th>field</th><th>duration</th><th>integrations</th>
+  </tr></thead>
+  <tbody>
+  {% for s in scans %}
+  <tr>
+    <td>{{ s.scan_number }}</td>
+    <td>{{ s.field_name }}</td>
+    <td>{{ s.duration_human if s.duration_human else (s.duration_s.value | string + "s" if s.duration_s.flag == "COMPLETE" else "—") }}</td>
+    <td>{{ s.n_integrations.value if s.n_integrations and s.n_integrations.flag == "COMPLETE" else "—" }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+{# ── Macro: render SPW list ──────────────────────────────────────────── #}
+{% macro render_spws(spws) %}
+<table class="scan-table">
+  <thead><tr>
+    <th>spw</th><th>centre freq</th><th>bandwidth</th><th>channels</th>
+  </tr></thead>
+  <tbody>
+  {% for s in spws %}
+  <tr>
+    <td>{{ s.spw_id }}</td>
+    <td>{{ s.centre_freq_human if s.centre_freq_human else "—" }}</td>
+    <td>{{ s.total_bw_human if s.total_bw_human else "—" }}</td>
+    <td>{{ s.n_channels.value if s.n_channels and s.n_channels.flag == "COMPLETE" else "—" }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endmacro %}
+
+{# ── Macro: dispatch to the right renderer per tool ──────────────────── #}
+{% macro render_tool(name, output) %}
+{% set data = output.get("data", {}) %}
+{% set warnings = output.get("warnings", []) %}
+{% set completeness = output.get("completeness_summary", "") %}
+
+<div class="tool-body">
+  {# completeness badge #}
+  <div class="tool-meta">
+    <span class="completeness completeness-{{ completeness.lower() }}">{{ completeness }}</span>
+    {% if output.status != "ok" %}<span class="completeness completeness-error">{{ output.status }}</span>{% endif %}
+  </div>
+
+  {# warnings #}
+  {% for w in warnings %}
+  <div class="tool-warning">⚠ {{ w }}</div>
+  {% endfor %}
+
+  {# structured content per tool type #}
+  {% if name == "ms_field_list" and data.fields %}
+    <div class="kv-label">{{ data.n_fields }} field{{ 's' if data.n_fields != 1 else '' }}</div>
+    {{ render_fields_list(data.fields) }}
+
+  {% elif name == "ms_scan_list" and data.scans %}
+    <div class="kv-label">{{ data.n_scans }} scans · {{ data.n_fields }} fields</div>
+    {{ render_scans(data.scans) }}
+
+  {% elif name == "ms_spectral_window_list" and data.spectral_windows %}
+    <div class="kv-label">{{ data.n_spw }} spectral windows · {{ data.telescope }}</div>
+    {{ render_spws(data.spectral_windows) }}
+
+  {% elif name == "ms_scan_intent_summary" and data.by_intent %}
+    <div class="kv-label">{{ data.total_duration_human }} total · {{ data.n_intents }} intent{{ 's' if data.n_intents != 1 else '' }}</div>
+    <table class="scan-table">
+      <thead><tr><th>intent / field</th><th>time</th><th>fraction</th></tr></thead>
+      <tbody>
+      {% for i in data.by_intent %}
+      <tr>
+        <td>{{ i.intent }}</td>
+        <td>{{ i.human }}</td>
+        <td>
+          <div class="intent-bar-wrap">
+            <div class="intent-bar" style="width:{{ (i.fraction * 100) | round(0) }}%"></div>
+            <span>{{ (i.fraction * 100) | round(1) }}%</span>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+  {% else %}
+    {# generic key-value fallback #}
+    <table class="kv-table">
+      <tbody>{{ render_tool_data(data) }}</tbody>
+    </table>
+  {% endif %}
+</div>
+{% endmacro %}
+
+<!-- ── Workflow status bar ───────────────────────────────────────────── -->
+<div class="status-bar">
+  <span class="stage-badge stage-{{ stage.lower() }}">{{ stage }}</span>
+  <span class="updated">updated {{ workflow.updated_at }}</span>
+  {% if not is_terminal %}
+  <form method="post" action="/pipeline/{{ workflow.id }}/stop" class="stop-form" onsubmit="return confirm('Stop the pipeline at the next safe checkpoint?')">
+    <button type="submit" class="btn-stop">⏹ Stop pipeline</button>
+  </form>
+  {% elif is_stopped %}
+  <span class="stopped-notice">Pipeline stopped by user request</span>
+  {% endif %}
+</div>
+
+<!-- ── Phase cards ──────────────────────────────────────────────────── -->
+<section class="section">
+  <h2 class="section-title">MCP Tool Calls</h2>
+  {% for p in phase_data %}
+  {% if p.tools %}
+  <div class="phase-card">
+    <div class="phase-header">
+      <span class="phase-label">Phase {{ p.phase }}</span>
+      <span class="tool-count">{{ p.tools | length }} tool{{ 's' if p.tools | length != 1 else '' }}</span>
+    </div>
+    <div class="tool-list">
+      {% for tool in p.tools %}
+      <details class="tool-row">
+        <summary class="tool-summary">
+          <span class="tool-name">{{ tool.name }}</span>
+          <span class="tool-ts">{{ tool.collected_at }}</span>
+        </summary>
+        {{ render_tool(tool.name, tool.output) }}
+      </details>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  {% endfor %}
+  {% if is_running and not phase_data[0].tools %}
+  <div class="phase-card">
+    <div class="phase-header">
+      <span class="phase-label">
+        {% if "PHASE1" in stage %}Phase 1{% elif "PHASE2" in stage %}Phase 2{% else %}Phase 3{% endif %}
+      </span>
+      <span style="color:#7dd3fc; font-size:0.8rem">
+        <span class="poll-dot"></span>running — waiting for MCP tool responses…
+      </span>
+    </div>
+  </div>
+  {% elif not phase_data or not phase_data[0].tools %}
+  <p class="empty-notice">No tool outputs yet.</p>
+  {% endif %}
+</section>
+
+<!-- ── LLM decisions ─────────────────────────────────────────────────── -->
+<section class="section">
+  <h2 class="section-title">LLM Decisions</h2>
+  {% if is_running and not decisions %}
+  <div class="decision-card" style="border-color:#1e3a5f">
+    <span class="poll-dot"></span>
+    <span style="color:#7dd3fc; font-size:0.85rem">LLM is reasoning over tool outputs…</span>
+  </div>
+  {% endif %}
+  {% for dec in decisions %}
+  <div class="decision-card">
+    <div class="decision-header">
+      <span class="dec-stage">{{ dec.stage }}</span>
+      <span class="dec-model">{{ dec.model }}</span>
+      <span class="dec-ts">{{ dec.decided_at }}</span>
+    </div>
+
+    {# Summary is the primary output — show it large #}
+    {% if dec.decision.summary %}
+    <div class="dec-summary">{{ dec.decision.summary }}</div>
+    {% endif %}
+
+    <div class="dec-fields">
+      <div class="dec-field">
+        <span class="field-label">decision</span>
+        <span class="field-value stage-badge stage-{{ dec.decision.next_stage.lower() if dec.decision.next_stage else '' }}">
+          {{ dec.decision.next_stage or '—' }}
+        </span>
+      </div>
+      {% if dec.decision.casa_script %}
+      <div class="dec-field">
+        <span class="field-label">CASA script</span>
+        <span class="field-value" style="color:#86efac">queued</span>
+      </div>
+      {% endif %}
+    </div>
+
+    {% if dec.decision.reasoning %}
+    <details class="reasoning-details">
+      <summary>reasoning trace</summary>
+      <div class="reasoning-body">{{ dec.decision.reasoning }}</div>
+    </details>
+    {% endif %}
+
+    {% if dec.decision.casa_script %}
+    <details class="reasoning-details">
+      <summary>CASA script</summary>
+      <pre class="json-block">{{ dec.decision.casa_script }}</pre>
+    </details>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% if not decisions and not is_running %}
+  <p class="empty-notice">No LLM decisions yet.</p>
+  {% endif %}
+</section>
+
+<!-- ── CASA jobs / artifacts ─────────────────────────────────────────── -->
+<section class="section">
+  <h2 class="section-title">CASA Jobs &amp; Artifacts</h2>
+  {% for job in jobs %}
+  <div class="job-card">
+    <div class="job-header">
+      <span class="job-stage">{{ job.stage }}</span>
+      <span class="job-status status-{{ job.status }}">{{ job.status }}</span>
+      <span class="job-ts">queued {{ job.queued_at }}</span>
+    </div>
+    <div class="job-path">{{ job.script_path }}</div>
+    {% if job.plots %}
+    {% set plot_list = job.plots.split(',') %}
+    <div class="plot-grid">
+      {% for plot in plot_list %}{% if plot.strip() %}
+      <a href="/jobs/{{ plot.strip().split('/jobs/')[-1] }}" target="_blank">
+        <img class="plot-thumb" src="/jobs/{{ plot.strip().split('/jobs/')[-1] }}" alt="plot">
+      </a>
+      {% endif %}{% endfor %}
+    </div>
+    {% endif %}
+    {% if job.stdout %}
+    <details class="reasoning-details"><summary>stdout</summary>
+      <pre class="json-block">{{ job.stdout }}</pre></details>
+    {% endif %}
+    {% if job.stderr %}
+    <details class="reasoning-details"><summary>stderr</summary>
+      <pre class="json-block" style="color:#f87171">{{ job.stderr }}</pre></details>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% if not jobs %}
+  <p class="empty-notice">No CASA jobs submitted yet.</p>
+  {% endif %}
+</section>

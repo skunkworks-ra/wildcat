@@ -97,12 +97,13 @@ async def main_async() -> None:
 
             # ── Runner + watcher ─────────────────────────────────────────
             checkpoint_event = asyncio.Event()
+            stop_event = asyncio.Event()
             runner = CASARunner(cfg.casa, db)
             watcher = SentinelWatcher(Path(cfg.casa.jobs_dir), checkpoint_event)
             watcher.start()
 
             # ── UI ────────────────────────────────────────────────────────
-            ui_app = build_ui_app(db, checkpoint_event)
+            ui_app = build_ui_app(db, checkpoint_event, stop_event)
             ui_config = uvicorn.Config(
                 ui_app, host="0.0.0.0", port=cfg.ui.port, log_level="warning"
             )
@@ -118,6 +119,7 @@ async def main_async() -> None:
                 skills_path=cfg.skills.path,
                 runner=runner,
                 checkpoint_event=checkpoint_event,
+                stop_event=stop_event,
             )
 
             try:

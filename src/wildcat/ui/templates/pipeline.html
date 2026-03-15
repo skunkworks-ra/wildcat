@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>wildcat — pipeline monitor</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12/dist/htmx.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      padding: 2rem;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+
+    h1 { font-size: 1.5rem; color: #7dd3fc; margin-bottom: 0.25rem; }
+    .subtitle { color: #64748b; font-size: 0.85rem; margin-bottom: 1.5rem; font-family: ui-monospace, monospace; }
+    nav { margin-bottom: 1.5rem; font-size: 0.85rem; }
+    nav a { color: #64748b; text-decoration: none; margin-right: 1.5rem; }
+    nav a:hover { color: #7dd3fc; }
+
+    /* ── Status bar ─────────────────────────────────────────────────── */
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 0.75rem 1rem;
+      background: #1e293b;
+      border-radius: 6px;
+      margin-bottom: 2rem;
+      flex-wrap: wrap;
+    }
+    .updated { color: #64748b; font-size: 0.8rem; margin-left: auto; }
+    .stopped-notice { color: #fde68a; font-size: 0.85rem; }
+
+    /* ── Stage badges ───────────────────────────────────────────────── */
+    .stage-badge {
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.2rem 0.6rem;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      letter-spacing: 0.03em;
+    }
+    .stage-phase1_running, .stage-phase2_running, .stage-phase3_running
+                         { background: #1d4ed8; color: #bfdbfe; }
+    .stage-human_checkpoint { background: #7c3aed; color: #ddd6fe; }
+    .stage-imaging_pipeline { background: #065f46; color: #6ee7b7; }
+    .stage-calibration_loop { background: #92400e; color: #fde68a; }
+    .stage-stopped          { background: #374151; color: #9ca3af; }
+    .stage-error            { background: #7f1d1d; color: #fca5a5; }
+    .stage-idle, .stage-phase1_complete,
+    .stage-phase2_complete, .stage-phase3_complete
+                            { background: #1e293b; color: #94a3b8; }
+
+    /* ── Stop button ─────────────────────────────────────────────────── */
+    .stop-form { display: inline; }
+    .btn-stop {
+      background: #7f1d1d;
+      color: #fca5a5;
+      border: 1px solid #991b1b;
+      padding: 0.35rem 0.85rem;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.8rem;
+      transition: background 0.15s;
+    }
+    .btn-stop:hover { background: #991b1b; }
+
+    /* ── Sections ────────────────────────────────────────────────────── */
+    .section { margin-bottom: 2.5rem; }
+    .section-title {
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #64748b;
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.4rem;
+      border-bottom: 1px solid #1e293b;
+    }
+    .empty-notice { color: #475569; font-size: 0.85rem; font-style: italic; }
+
+    /* ── Phase cards ─────────────────────────────────────────────────── */
+    .phase-card {
+      background: #131a27;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+      overflow: hidden;
+    }
+    .phase-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.6rem 1rem;
+      background: #1e293b;
+    }
+    .phase-label { font-weight: 600; color: #7dd3fc; font-size: 0.9rem; }
+    .tool-count { color: #64748b; font-size: 0.8rem; }
+    .tool-list { padding: 0.25rem 0; }
+
+    /* ── Tool rows ───────────────────────────────────────────────────── */
+    .tool-row { border-bottom: 1px solid #1e293b; }
+    .tool-row:last-child { border-bottom: none; }
+    .tool-summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.55rem 1rem;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+    .tool-summary:hover { background: #1a2232; }
+    .tool-name { font-family: ui-monospace, monospace; color: #fdba74; font-size: 0.85rem; }
+    .tool-ts { color: #475569; font-size: 0.75rem; font-family: ui-monospace, monospace; }
+
+    /* ── LLM decision cards ──────────────────────────────────────────── */
+    .decision-card {
+      background: #131a27;
+      border: 1px solid #312e81;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+      padding: 1rem;
+    }
+    .decision-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .dec-stage { font-family: ui-monospace, monospace; font-size: 0.8rem; color: #a5b4fc; }
+    .dec-model { color: #64748b; font-size: 0.75rem; }
+    .dec-ts { color: #475569; font-size: 0.75rem; margin-left: auto; }
+    .dec-summary {
+      color: #cbd5e1;
+      font-size: 0.9rem;
+      line-height: 1.6;
+      margin-bottom: 0.75rem;
+      padding: 0.6rem 0.75rem;
+      background: #0f172a;
+      border-left: 3px solid #6366f1;
+      border-radius: 0 4px 4px 0;
+    }
+    .dec-fields { display: flex; gap: 1.5rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+    .dec-field { display: flex; align-items: center; gap: 0.5rem; }
+    .field-label { font-size: 0.75rem; color: #64748b; }
+    .field-value { font-size: 0.8rem; }
+
+    /* ── Job cards ───────────────────────────────────────────────────── */
+    .job-card {
+      background: #131a27;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      margin-bottom: 1rem;
+      padding: 1rem;
+    }
+    .job-header { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+    .job-stage { font-family: ui-monospace, monospace; font-size: 0.8rem; color: #7dd3fc; }
+    .job-status { font-size: 0.75rem; font-weight: 600; padding: 0.15rem 0.5rem; border-radius: 3px; }
+    .status-pending  { background: #1e293b; color: #94a3b8; }
+    .status-running  { background: #1d4ed8; color: #bfdbfe; }
+    .status-done     { background: #065f46; color: #6ee7b7; }
+    .status-failed   { background: #7f1d1d; color: #fca5a5; }
+    .job-ts { color: #475569; font-size: 0.75rem; margin-left: auto; }
+    .job-path { font-family: ui-monospace, monospace; font-size: 0.75rem; color: #475569; margin-bottom: 0.75rem; }
+
+    /* ── Plot thumbnails ─────────────────────────────────────────────── */
+    .plot-grid { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+    .plot-thumb {
+      width: 200px;
+      height: 150px;
+      object-fit: cover;
+      border-radius: 4px;
+      border: 1px solid #1e293b;
+    }
+    .plot-thumb:hover { border-color: #7dd3fc; }
+
+    /* ── Shared ──────────────────────────────────────────────────────── */
+    .json-block {
+      background: #0a0d14;
+      border: 1px solid #1e293b;
+      border-radius: 4px;
+      padding: 0.75rem 1rem;
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #94a3b8;
+      overflow-x: auto;
+      margin-top: 0.5rem;
+    }
+    .reasoning-details { margin-top: 0.5rem; }
+    .reasoning-details > summary {
+      font-size: 0.78rem;
+      color: #64748b;
+      cursor: pointer;
+      user-select: none;
+      padding: 0.25rem 0;
+    }
+    .reasoning-details > summary:hover { color: #94a3b8; }
+    .reasoning-body {
+      color: #94a3b8;
+      font-size: 0.85rem;
+      line-height: 1.6;
+      padding: 0.5rem 0 0.25rem;
+    }
+
+    /* ── Key-value table ─────────────────────────────────────────────── */
+    .kv-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; margin-top: 0.5rem; }
+    .kv-key { color: #94a3b8; padding: 0.3rem 1rem 0.3rem 0; width: 38%; white-space: nowrap; text-transform: lowercase; }
+    .kv-val { color: #e2e8f0; padding: 0.3rem 0.5rem; }
+    .kv-flag { width: 1.5rem; text-align: center; font-size: 0.7rem; }
+    .flag-complete { color: #4ade80; }
+    .flag-unavail  { color: #374151; }
+    .kv-unavail td { color: #374151 !important; }
+    .kv-label { font-size: 0.75rem; color: #64748b; margin: 0.5rem 0 0.4rem; }
+
+    /* ── Tool body / meta ────────────────────────────────────────────── */
+    .tool-body { padding: 0.75rem 1rem 0.75rem; border-top: 1px solid #1e293b; }
+    .tool-meta { margin-bottom: 0.5rem; }
+    .tool-warning {
+      font-size: 0.8rem; color: #fde68a;
+      background: #292310; border-left: 3px solid #ca8a04;
+      padding: 0.35rem 0.6rem; border-radius: 0 3px 3px 0;
+      margin-bottom: 0.4rem;
+    }
+    .completeness {
+      font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em;
+      padding: 0.15rem 0.45rem; border-radius: 3px; margin-right: 0.4rem;
+    }
+    .completeness-complete { background: #064e3b; color: #6ee7b7; }
+    .completeness-unavailable { background: #1e293b; color: #64748b; }
+    .completeness-error { background: #7f1d1d; color: #fca5a5; }
+
+    /* ── Field chips (field list) ────────────────────────────────────── */
+    .fields-list { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.4rem; }
+    .field-chip {
+      display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem;
+      background: #0f172a; padding: 0.4rem 0.6rem; border-radius: 4px;
+      font-size: 0.8rem;
+    }
+    .fc-name { color: #e2e8f0; font-weight: 600; }
+    .fc-coord { color: #64748b; font-family: ui-monospace, monospace; font-size: 0.75rem; }
+    .fc-intent { background: #1e3a5f; color: #93c5fd; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.72rem; }
+    .fc-cal { background: #1a2e1a; color: #86efac; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.72rem; }
+
+    /* ── Scan / SPW tables ───────────────────────────────────────────── */
+    .scan-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-top: 0.4rem; }
+    .scan-table th { color: #64748b; font-weight: 500; text-align: left; padding: 0.25rem 0.5rem; border-bottom: 1px solid #1e293b; }
+    .scan-table td { color: #cbd5e1; padding: 0.3rem 0.5rem; border-bottom: 1px solid #0f172a; }
+    .scan-table tr:last-child td { border-bottom: none; }
+
+    /* ── Intent bar ──────────────────────────────────────────────────── */
+    .intent-bar-wrap { display: flex; align-items: center; gap: 0.5rem; }
+    .intent-bar { height: 6px; background: #3b82f6; border-radius: 3px; min-width: 2px; }
+    .intent-bar-wrap span { color: #94a3b8; font-size: 0.75rem; white-space: nowrap; }
+
+    /* ── Polling indicator ───────────────────────────────────────────── */
+    .poll-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: #3b82f6;
+      display: inline-block;
+      margin-right: 0.4rem;
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+  </style>
+</head>
+<body>
+
+<h1>wildcat</h1>
+<div class="subtitle">workflow #{{ workflow.id }} · {{ workflow.ms_path }}</div>
+
+<nav>
+  <a href="/checkpoint/{{ workflow.id }}">checkpoint</a>
+  <a href="/logs">logs</a>
+</nav>
+
+<div id="pipeline-panel"
+     hx-get="/pipeline/{{ workflow.id }}/fragment"
+     hx-trigger="load, every 1s"
+     hx-swap="innerHTML">
+  <p style="color:#64748b; font-size:0.85rem">
+    <span class="poll-dot"></span>Loading pipeline data…
+  </p>
+</div>
+
+</body>
+</html>

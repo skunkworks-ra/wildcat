@@ -33,10 +33,18 @@ _LOG_PATH = "/var/log/wildcat.log"
 
 
 async def _tail_log(log_path: str):
-    """Yield SSE-formatted lines by tailing a log file."""
+    """Yield SSE-formatted lines by tailing a log file.
+
+    Replays the last 500 lines on connect so the UI is never empty,
+    then follows new lines as they arrive.
+    """
     try:
         with open(log_path) as f:
-            f.seek(0, 2)  # start at end of file
+            # Replay existing content (last 500 lines) before following
+            lines = f.readlines()
+            for line in lines[-500:]:
+                yield f"data: {line.rstrip()}\n\n"
+            # Now follow new lines
             while True:
                 line = f.readline()
                 if line:
@@ -47,7 +55,7 @@ async def _tail_log(log_path: str):
         yield f"data: [log file not found: {log_path}]\n\n"
 
 
-def build_ui_app(db: StateDB, checkpoint_event: asyncio.Event) -> FastAPI:
+def build_ui_app(db: StateDB, checkpoint_event: asyncio.Event, stop_event: asyncio.Event | None = None) -> FastAPI:
     """Construct the FastAPI application with all routes wired up."""
     app = FastAPI(title="wildcat checkpoint UI")
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
@@ -145,6 +153,94 @@ def build_ui_app(db: StateDB, checkpoint_event: asyncio.Event) -> FastAPI:
     async def logs_page(request: Request) -> HTMLResponse:
         """Render the live log stream page."""
         return templates.TemplateResponse("logs.html", {"request": request})
+
+    @router.get("/pipeline/{workflow_id}", response_class=HTMLResponse)
+    async def pipeline_page(request: Request, workflow_id: int) -> HTMLResponse:
+        """Render the pipeline transparency monitor page."""
+        try:
+            wf = db.get_workflow(workflow_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
+        return templates.TemplateResponse(
+            "pipeline.html",
+            {"request": request, "workflow": wf},
+        )
+
+    @router.get("/pipeline/{workflow_id}/fragment", response_class=HTMLResponse)
+    async def pipeline_fragment(request: Request, workflow_id: int) -> HTMLResponse:
+        """HTMX polling fragment — returns the full pipeline data panel."""
+        try:
+            wf = db.get_workflow(workflow_id)
+        except KeyError:
+            return HTMLResponse("<p style='color:#f87171'>Workflow not found</p>")
+
+        phase_data = []
+        for phase_num, phase_label in [(1, "phase1"), (2, "phase2"), (3, "phase3")]:
+            rows = db.get_tool_outputs(workflow_id, phase_label)
+            tools_parsed = []
+            for row in rows:
+                try:
+                    parsed = json.loads(row["output_json"])
+                except json.JSONDecodeError:
+                    parsed = {"raw": row.get("output_json", "")}
+                tools_parsed.append({"name": row["tool_name"], "output": parsed, "collected_at": row["collected_at"]})
+            phase_data.append({"phase": phase_num, "label": phase_label, "tools": tools_parsed})
+
+        llm_decisions = db.conn.execute(
+            "SELECT stage, decision, model, decided_at FROM llm_decisions"
+            " WHERE workflow_id = ? ORDER BY decided_at",
+            (workflow_id,),
+        ).fetchall()
+        decisions_parsed = []
+        for row in llm_decisions:
+            try:
+                dec = json.loads(row["decision"])
+            except json.JSONDecodeError:
+                dec = {"raw": row["decision"]}
+            decisions_parsed.append({
+                "stage": row["stage"],
+                "model": row["model"],
+                "decided_at": row["decided_at"],
+                "decision": dec,
+            })
+
+        jobs = db.conn.execute(
+            "SELECT stage, script_path, status, stdout, stderr, plots, queued_at, completed_at"
+            " FROM jobs WHERE workflow_id = ? ORDER BY queued_at",
+            (workflow_id,),
+        ).fetchall()
+        jobs_data = [dict(j) for j in jobs]
+
+        return templates.TemplateResponse(
+            "pipeline_fragment.html",
+            {
+                "request": request,
+                "workflow": wf,
+                "phase_data": phase_data,
+                "decisions": decisions_parsed,
+                "jobs": jobs_data,
+            },
+        )
+
+    @router.post("/pipeline/{workflow_id}/stop")
+    async def stop_pipeline(workflow_id: int) -> dict:
+        """Signal the orchestrator to stop at the next safe boundary."""
+        try:
+            wf = db.get_workflow(workflow_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
+
+        terminal = {"STOPPED", "IMAGING_PIPELINE", "CALIBRATION_LOOP", "ERROR"}
+        if wf["stage"] in terminal:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Workflow is already in terminal state {wf['stage']!r}",
+            )
+
+        if stop_event is not None:
+            stop_event.set()
+            log.info("Stop signal sent for workflow %d", workflow_id)
+        return {"status": "stop_requested"}
 
     @router.get("/logs/stream")
     async def logs_stream() -> StreamingResponse:
