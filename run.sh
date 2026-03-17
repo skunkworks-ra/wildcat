@@ -10,9 +10,8 @@ OUTPUT_DIR=/home/pjaganna/Data/wildcat-output
 
 CONTAINER_MS=/data/ms/3C129_1.ms
 
-# Optional: set MODEL_PATH to a local GGUF file to skip HuggingFace download.
-# e.g. MODEL_PATH=/home/pjaganna/Models/qwen3.5-4b.gguf
-MODEL_PATH="${MODEL_PATH:-/home/pjaganna/.cache/llama.cpp/unsloth_Qwen3.5-4B-GGUF_Qwen3.5-4B-UD-Q4_K_XL.gguf}"
+# MODEL_PATH must be set externally — run: export MODEL_PATH=$(./fetch-model.sh)
+MODEL_PATH="${MODEL_PATH:-}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -21,26 +20,25 @@ step() { echo -e "\n${GREEN}▶ $*${NC}"; }
 warn() { echo -e "${YELLOW}⚠  $*${NC}"; }
 fail() { echo -e "${RED}✗  $*${NC}"; exit 1; }
 
-# ── Step 0: Preflight ─────────────────────────────────────────────────────────
+# ── Step 1: Preflight ─────────────────────────────────────────────────────────
 step "Preflight checks"
+
+cd "$(dirname "$0")"
 
 [ -d "$MS_PATH" ]        || fail "MS not found: $MS_PATH"
 [ -d "$MS_INSPECT_SRC" ] || fail "ms-inspect source not found: $MS_INSPECT_SRC"
 [ -d "$SKILLS_SRC" ]     || fail "Skills not found: $SKILLS_SRC"
 mkdir -p "$OUTPUT_DIR"
 
-echo "  MS:        $MS_PATH"
+podman image exists "$IMAGE" || fail "Image '$IMAGE' not found — run ./build.sh first"
+
+[ -n "$MODEL_PATH" ] || fail "MODEL_PATH is not set — run: export MODEL_PATH=\$(./fetch-model.sh)"
+[ -f "$MODEL_PATH" ] || fail "Model file not found: $MODEL_PATH — run: export MODEL_PATH=\$(./fetch-model.sh)"
+
+echo "  MS:         $MS_PATH"
 echo "  ms-inspect: $MS_INSPECT_SRC"
-echo "  output:    $OUTPUT_DIR"
-
-# ── Step 1: Build ─────────────────────────────────────────────────────────────
-step "Building container image (this takes ~10-15 min on first run — CUDA compile)"
-
-cd "$(dirname "$0")"
-podman build -t "$IMAGE" . 2>&1 | while IFS= read -r line; do
-    echo "  [build] $line"
-done
-echo "  Image built: $IMAGE"
+echo "  model:      $MODEL_PATH"
+echo "  output:     $OUTPUT_DIR"
 
 # ── Step 2: Start container ───────────────────────────────────────────────────
 step "Starting container"
@@ -48,15 +46,7 @@ step "Starting container"
 # Clean up any previous run
 podman rm -f wildcat-test 2>/dev/null || true
 
-# Build model mount args
-MODEL_MOUNT_ARGS=()
-if [ -n "$MODEL_PATH" ]; then
-    [ -f "$MODEL_PATH" ] || fail "MODEL_PATH set but file not found: $MODEL_PATH"
-    MODEL_MOUNT_ARGS=(-v "$MODEL_PATH":/models/model.gguf:ro)
-    echo "  Model:     $MODEL_PATH (local)"
-else
-    echo "  Model:     HuggingFace download (set MODEL_PATH to skip)"
-fi
+MODEL_MOUNT_ARGS=(-v "$MODEL_PATH":/models/model.gguf:ro)
 
 podman run -d \
     --name wildcat-test \

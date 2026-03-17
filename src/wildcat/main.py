@@ -55,6 +55,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Resume an existing workflow by ID (default: create new)",
     )
+    parser.add_argument(
+        "--autostart",
+        action="store_true",
+        default=False,
+        help="Start the pipeline immediately without waiting for UI confirmation",
+    )
     return parser.parse_args()
 
 
@@ -76,10 +82,37 @@ async def main_async() -> None:
     log.info("Loaded config from %s", args.config)
     log.info("LLM backend: %s", cfg.llm.backend)
 
+    # ── Start gate ───────────────────────────────────────────────────────
+    # Priority: --autostart flag > WILDCAT_AUTOSTART env var > UI button
+    autostart = args.autostart or bool(os.environ.get("WILDCAT_AUTOSTART"))
+    start_event = asyncio.Event()
+    if autostart:
+        start_event.set()
+        log.info("Autostart enabled — pipeline will begin immediately")
+
     # ── State ────────────────────────────────────────────────────────────
     with StateDB(cfg.state.db_path) as db:
         db.init_schema()
 
+        # ── Shared events ─────────────────────────────────────────────────
+        checkpoint_event = asyncio.Event()
+        stop_event = asyncio.Event()
+
+        # ── UI (starts before pipeline so waiting screen is reachable) ────
+        ui_app = build_ui_app(db, checkpoint_event, stop_event, start_event, ms_path)
+        ui_config = uvicorn.Config(
+            ui_app, host="0.0.0.0", port=cfg.ui.port, log_level="warning"
+        )
+        ui_server = uvicorn.Server(ui_config)
+        ui_task = asyncio.create_task(ui_server.serve())
+        log.info("UI listening on http://0.0.0.0:%d", cfg.ui.port)
+
+        if not autostart:
+            log.info("Waiting for start signal — visit http://0.0.0.0:%d/start", cfg.ui.port)
+            await start_event.wait()
+            log.info("Start signal received — beginning pipeline")
+
+        # ── Workflow ──────────────────────────────────────────────────────
         if args.workflow_id is not None:
             workflow_id = args.workflow_id
             wf = db.get_workflow(workflow_id)
@@ -96,20 +129,9 @@ async def main_async() -> None:
         async with MSInspectClient(cfg.mcp.base_url) as tools:
 
             # ── Runner + watcher ─────────────────────────────────────────
-            checkpoint_event = asyncio.Event()
-            stop_event = asyncio.Event()
             runner = CASARunner(cfg.casa, db)
             watcher = SentinelWatcher(Path(cfg.casa.jobs_dir), checkpoint_event)
             watcher.start()
-
-            # ── UI ────────────────────────────────────────────────────────
-            ui_app = build_ui_app(db, checkpoint_event, stop_event)
-            ui_config = uvicorn.Config(
-                ui_app, host="0.0.0.0", port=cfg.ui.port, log_level="warning"
-            )
-            ui_server = uvicorn.Server(ui_config)
-            ui_task = asyncio.create_task(ui_server.serve())
-            log.info("Checkpoint UI listening on http://0.0.0.0:%d", cfg.ui.port)
 
             # ── Orchestrator ──────────────────────────────────────────────
             orchestrator = Orchestrator(

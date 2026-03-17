@@ -56,13 +56,55 @@ async def _tail_log(log_path: str):
         yield f"data: [log file not found: {log_path}]\n\n"
 
 
-def build_ui_app(db: StateDB, checkpoint_event: asyncio.Event, stop_event: asyncio.Event | None = None) -> FastAPI:
+def build_ui_app(
+    db: StateDB,
+    checkpoint_event: asyncio.Event,
+    stop_event: asyncio.Event | None = None,
+    start_event: asyncio.Event | None = None,
+    ms_path: str | None = None,
+) -> FastAPI:
     """Construct the FastAPI application with all routes wired up."""
     app = FastAPI(title="wildcat checkpoint UI")
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
     templates.env.filters["tojson"] = lambda v, **kw: json.dumps(v, **kw)
 
     router = APIRouter()
+
+    @router.get("/start", response_class=HTMLResponse)
+    async def start_page(request: Request) -> HTMLResponse:
+        """Waiting screen shown when autostart is not set."""
+        # Predict the next workflow_id from the current max (SQLite AUTOINCREMENT).
+        row = db.conn.execute("SELECT MAX(id) AS max_id FROM workflow").fetchone()
+        next_id = (row["max_id"] or 0) + 1
+        already_started = start_event is not None and start_event.is_set()
+        return templates.TemplateResponse(
+            "start.html",
+            {
+                "request":         request,
+                "ms_path":         ms_path or "unknown",
+                "next_workflow_id": next_id,
+                "already_started": already_started,
+            },
+        )
+
+    @router.post("/start")
+    async def do_start(request: Request) -> HTMLResponse:
+        """Fire the start event and redirect to the starting page."""
+        if start_event is not None and not start_event.is_set():
+            start_event.set()
+            log.info("Pipeline start triggered via UI")
+        # next_id prediction: same logic as start_page
+        row = db.conn.execute("SELECT MAX(id) AS max_id FROM workflow").fetchone()
+        next_id = (row["max_id"] or 0) + 1
+        return templates.TemplateResponse(
+            "start.html",
+            {
+                "request":          request,
+                "ms_path":          ms_path or "unknown",
+                "next_workflow_id": next_id,
+                "already_started":  True,
+            },
+        )
 
     @router.get("/checkpoint/{workflow_id}", response_class=HTMLResponse)
     async def show_checkpoint(request: Request, workflow_id: int) -> HTMLResponse:

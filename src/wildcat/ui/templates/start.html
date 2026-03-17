@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>wildcat — ready to start</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      padding: 2rem;
+      max-width: 640px;
+      margin: 0 auto;
+    }
+    h1 { font-size: 1.5rem; color: #7dd3fc; margin-bottom: 0.25rem; }
+    .subtitle { color: #64748b; font-size: 0.85rem; margin-bottom: 2rem; font-family: ui-monospace, monospace; }
+
+    .card {
+      background: #1e293b;
+      border-radius: 8px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    .label { color: #64748b; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+    .value { font-family: ui-monospace, monospace; font-size: 0.9rem; color: #e2e8f0; word-break: break-all; }
+    .workflow-id { font-size: 1.1rem; color: #86efac; }
+
+    .btn-start {
+      display: block;
+      width: 100%;
+      padding: 0.85rem;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-start:hover { background: #1d4ed8; }
+    .btn-start:disabled { background: #334155; color: #64748b; cursor: default; }
+
+    .started-notice {
+      background: #14532d;
+      border: 1px solid #166534;
+      border-radius: 6px;
+      padding: 1rem 1.25rem;
+      color: #86efac;
+      font-size: 0.9rem;
+      margin-bottom: 1.5rem;
+    }
+    .started-notice a { color: #7dd3fc; }
+
+    nav { margin-top: 2rem; font-size: 0.85rem; }
+    nav a { color: #64748b; text-decoration: none; margin-right: 1.5rem; }
+    nav a:hover { color: #7dd3fc; }
+  </style>
+</head>
+<body>
+  <h1>wildcat</h1>
+  <p class="subtitle">agentic radio interferometry reduction</p>
+
+  <div class="card">
+    <div class="label">Measurement Set</div>
+    <div class="value">{{ ms_path }}</div>
+  </div>
+
+  <div class="card">
+    <div class="label">Workflow ID (predicted)</div>
+    <div class="value workflow-id">#{{ next_workflow_id }}</div>
+  </div>
+
+  {% if already_started %}
+  <div class="started-notice">
+    Pipeline is starting — workflow #{{ next_workflow_id }} will be created shortly.<br>
+    <a href="/pipeline/{{ next_workflow_id }}">Open pipeline monitor →</a>
+    &nbsp;·&nbsp;
+    <a href="/logs">View logs →</a>
+  </div>
+  <button class="btn-start" disabled>Starting…</button>
+  {% else %}
+  <form method="post" action="/start">
+    <button class="btn-start" type="submit">Start Pipeline</button>
+  </form>
+  {% endif %}
+
+  <nav>
+    <a href="/logs">logs</a>
+  </nav>
+</body>
+</html>
