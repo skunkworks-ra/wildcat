@@ -2,7 +2,7 @@
 ## Agentic Radio Interferometry Reduction Pipeline
 
 **Status:** Working — Phase 1-2 end-to-end verified, calibration pipeline staged
-**Last revised:** 2026-03-15 (rev 4)
+**Last revised:** 2026-03-17 (rev 5)
 **Scope:** Orchestration layer. Phases 1–3 inspection + human checkpoint routing.
 
 ---
@@ -33,6 +33,11 @@ handoff to the human — and back — as frictionless as possible.
 - **Single container.** llama.cpp built from source with CUDA inside the image.
   ms-inspect volume-mounted and pip-installed at entrypoint. Model GGUF
   mounted at runtime.
+- **Explicit pipeline start gate.** The pipeline does not start automatically
+  on container boot. wildcat waits for an explicit start signal before creating
+  the workflow or starting the LLM. Priority: `--autostart` CLI flag >
+  `WILDCAT_AUTOSTART` env var > UI button at `/start`. This prevents accidental
+  GPU use and lets the operator verify configuration before committing.
 
 ---
 
@@ -105,6 +110,17 @@ ms-inspect exposes 20 tools total (verified against 3C129_1.ms).
 
 ## 3. Container
 
+### 3.1 Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `build.sh` | Builds the container image — run once or when `Containerfile` changes |
+| `fetch-model.sh` | Downloads the default GGUF (`unsloth/Qwen3.5-4B-GGUF`) from HuggingFace; uses `huggingface-cli` if available, falls back to `curl`; respects `HF_TOKEN`; outputs the local path to stdout |
+| `run.sh` | Starts the container — requires image and `MODEL_PATH` to exist; fails fast if either is missing |
+
+Override the model with `HF_REPO` / `HF_FILE` env vars. Override host ports with
+`PORT_MS_INSPECT` (default 8100), `PORT_LLAMA` (default 8180), `PORT_UI` (default 8181).
+
 **Base image:** `docker.io/nvidia/cuda:12.6.3-devel-ubuntu24.04`
 Note: CUDA 12.9.1 is incompatible with current llama.cpp (CCCL 2.9 macro
 breakage). 12.6.3 produces a binary that runs correctly on the host's 12.9
@@ -129,6 +145,7 @@ static binary resolves it at runtime from the CDI-injected driver.
 
 | Route | Purpose |
 |-------|---------|
+| `/start` | Pre-start gate — shows MS path, predicted workflow ID, Start Pipeline button |
 | `/pipeline/{id}` | Live pipeline transparency monitor — tool outputs, LLM decisions, CASA artifacts |
 | `/checkpoint/{id}` | Human checkpoint — structured questions, route decision |
 | `/logs` | Raw log stream (SSE tail of `/var/log/wildcat.log`) |
@@ -245,7 +262,7 @@ under CASA Jobs. The LLM may reference specific plot filenames in its
 
 ---
 
-## 5. Current Status (2026-03-15)
+## 5. Current Status (2026-03-17)
 
 ### Working
 - Container builds successfully (llama.cpp + CUDA 12.6, sm_86)
@@ -265,6 +282,11 @@ under CASA Jobs. The LLM may reference specific plot filenames in its
 - CASA script templates with deterministic sections (solint from scan
   durations, flagcal on BP caltable, rflag, metrics) and LLM-filled
   placeholders (field names, refant, flux standard)
+- Container scripts split: `build.sh` (image), `fetch-model.sh` (GGUF download),
+  `run.sh` (start only — preflight asserts both exist)
+- Pipeline start gate: `/start` UI screen with MS path confirmation;
+  `WILDCAT_AUTOSTART` / `--autostart` for automated runs
+- Host ports configurable via `PORT_MS_INSPECT` / `PORT_LLAMA` / `PORT_UI`
 
 ### Open / Next
 - End-to-end calibration test (CASA not yet in container)
