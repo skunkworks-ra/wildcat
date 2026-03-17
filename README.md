@@ -64,10 +64,10 @@ Once the pipeline has started, open these in your browser:
 
 | URL | What you see |
 |-----|-------------|
-| `http://localhost:8181/start` | Pre-start waiting screen — MS path confirmation and Start Pipeline button |
-| `http://localhost:8181/pipeline/1` | Live pipeline monitor — phase outputs, LLM decisions, job status |
-| `http://localhost:8181/logs` | Live log stream — tool calls, LLM inference, stage transitions, colour-coded in real time |
-| `http://localhost:8181/checkpoint/1` | Human checkpoint UI — LLM summary, key metrics table, imaging/calibration decision |
+| `http://localhost:$PORT_UI/start` | Pre-start waiting screen — MS path confirmation and Start Pipeline button |
+| `http://localhost:$PORT_UI/pipeline/1` | Live pipeline monitor — phase outputs, LLM decisions, job status |
+| `http://localhost:$PORT_UI/logs` | Live log stream — tool calls, LLM inference, stage transitions, colour-coded in real time |
+| `http://localhost:$PORT_UI/checkpoint/1` | Human checkpoint UI — LLM summary, key metrics table, imaging/calibration decision |
 
 The log stream auto-scrolls and colour-codes by line type: stage transitions
 (green), LLM calls (purple), tool calls (orange), warnings (yellow), errors (red).
@@ -81,11 +81,19 @@ podman exec wildcat-test tail -f /var/log/wildcat.log
 
 ## Ports
 
-| Port (host) | Service |
-|-------------|---------|
-| 8100 | ms-inspect MCP (SSE) |
-| 8180 | llama-server (OpenAI-compatible) |
-| 8181 | Checkpoint UI + log stream |
+Default host-side bindings — override any that conflict:
+
+| Env var | Default | Service |
+|---------|---------|---------|
+| `PORT_MS_INSPECT` | 8100 | ms-inspect MCP (SSE) |
+| `PORT_LLAMA` | 8180 | llama-server (OpenAI-compatible) |
+| `PORT_UI` | 8181 | Checkpoint UI + log stream |
+
+```bash
+PORT_UI=9181 PORT_LLAMA=9180 ./run.sh
+```
+
+Container-internal ports (8000 / 8080 / 8081) are fixed and never exposed directly.
 
 ## Configuration
 

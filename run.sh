@@ -10,6 +10,11 @@ OUTPUT_DIR=/home/pjaganna/Data/wildcat-output
 
 CONTAINER_MS=/data/ms/3C129_1.ms
 
+# Host-side port bindings — override if defaults conflict with other services
+PORT_MS_INSPECT="${PORT_MS_INSPECT:-8100}"    # → container :8000 (ms-inspect MCP)
+PORT_LLAMA="${PORT_LLAMA:-8180}"              # → container :8080 (llama-server)
+PORT_UI="${PORT_UI:-8181}"                    # → container :8081 (checkpoint UI)
+
 # MODEL_PATH must be set externally — run: export MODEL_PATH=$(./fetch-model.sh)
 MODEL_PATH="${MODEL_PATH:-}"
 
@@ -59,16 +64,16 @@ podman run -d \
     -v "$(dirname "$MS_PATH")":/data/ms:ro \
     -v "$OUTPUT_DIR":/data \
     "${MODEL_MOUNT_ARGS[@]+"${MODEL_MOUNT_ARGS[@]}"}" \
-    -p 8100:8000 -p 8180:8080 -p 8181:8081 \
+    -p "$PORT_MS_INSPECT":8000 -p "$PORT_LLAMA":8080 -p "$PORT_UI":8081 \
     "$IMAGE"
 
 echo "  Container started: wildcat-test"
 
 # ── Step 3: Wait for ms-inspect ───────────────────────────────────────────────
-step "Waiting for ms-inspect to be ready on :8000"
+step "Waiting for ms-inspect to be ready on :$PORT_MS_INSPECT"
 
 for i in $(seq 1 60); do
-    HTTP_CODE=$(curl -s --connect-timeout 2 --max-time 3 http://localhost:8100/sse -w "%{http_code}" -o /dev/null 2>/dev/null || true)
+    HTTP_CODE=$(curl -s --connect-timeout 2 --max-time 3 "http://localhost:$PORT_MS_INSPECT/sse" -w "%{http_code}" -o /dev/null 2>/dev/null || true)
     if [ "$HTTP_CODE" = "200" ]; then
         echo "  ms-inspect is up (attempt $i)"
         break
@@ -183,9 +188,9 @@ done
 # ── Done ──────────────────────────────────────────────────────────────────────
 step "All checks passed"
 echo ""
-echo "  Checkpoint UI:  http://localhost:8181/checkpoint/1"
-echo "  ms-inspect:     http://localhost:8100/mcp/v1/tools/list"
-echo "  llama-server:   http://localhost:8180/health"
+echo "  Checkpoint UI:  http://localhost:$PORT_UI/start"
+echo "  ms-inspect:     http://localhost:$PORT_MS_INSPECT/mcp/v1/tools/list"
+echo "  llama-server:   http://localhost:$PORT_LLAMA/health"
 echo ""
 echo "  Logs:  podman logs -f wildcat-test"
 echo "  Shell: podman exec -it wildcat-test bash"
