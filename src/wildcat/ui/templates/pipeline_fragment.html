@@ -197,7 +197,7 @@
     </div>
     <div class="tool-list">
       {% for tool in p.tools %}
-      <details class="tool-row">
+      <details class="tool-row" open>
         <summary class="tool-summary">
           <span class="tool-name">{{ tool.name }}</span>
           <span class="tool-ts">{{ tool.collected_at }}</span>
@@ -263,14 +263,14 @@
     </div>
 
     {% if dec.decision.reasoning %}
-    <details class="reasoning-details">
+    <details class="reasoning-details" open>
       <summary>reasoning trace</summary>
       <div class="reasoning-body">{{ dec.decision.reasoning }}</div>
     </details>
     {% endif %}
 
     {% if dec.decision.casa_script %}
-    <details class="reasoning-details">
+    <details class="reasoning-details" open>
       <summary>CASA script</summary>
       <pre class="json-block">{{ dec.decision.casa_script }}</pre>
     </details>
@@ -304,11 +304,11 @@
     </div>
     {% endif %}
     {% if job.stdout %}
-    <details class="reasoning-details"><summary>stdout</summary>
+    <details class="reasoning-details" open><summary>stdout</summary>
       <pre class="json-block">{{ job.stdout }}</pre></details>
     {% endif %}
     {% if job.stderr %}
-    <details class="reasoning-details"><summary>stderr</summary>
+    <details class="reasoning-details" open><summary>stderr</summary>
       <pre class="json-block" style="color:#f87171">{{ job.stderr }}</pre></details>
     {% endif %}
   </div>

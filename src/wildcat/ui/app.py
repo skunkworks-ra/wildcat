@@ -78,9 +78,9 @@ def build_ui_app(
         next_id = (row["max_id"] or 0) + 1
         already_started = start_event is not None and start_event.is_set()
         return templates.TemplateResponse(
+            request,
             "start.html",
             {
-                "request":         request,
                 "ms_path":         ms_path or "unknown",
                 "next_workflow_id": next_id,
                 "already_started": already_started,
@@ -97,9 +97,9 @@ def build_ui_app(
         row = db.conn.execute("SELECT MAX(id) AS max_id FROM workflow").fetchone()
         next_id = (row["max_id"] or 0) + 1
         return templates.TemplateResponse(
+            request,
             "start.html",
             {
-                "request":          request,
                 "ms_path":          ms_path or "unknown",
                 "next_workflow_id": next_id,
                 "already_started":  True,
@@ -157,9 +157,9 @@ def build_ui_app(
                 pass
 
         return templates.TemplateResponse(
+            request,
             "checkpoint.html",
             {
-                "request":              request,
                 "workflow":             wf,
                 "checkpoint":           checkpoint,
                 "tool_outputs":         tool_outputs,
@@ -216,9 +216,9 @@ def build_ui_app(
         already_decided = checkpoint and checkpoint.get("human_route") is not None
 
         return templates.TemplateResponse(
+            request,
             "checkpoint_panel.html",
             {
-                "request":              request,
                 "workflow_id":          workflow_id,
                 "checkpoint":           checkpoint,
                 "checkpoint_questions": checkpoint_questions,
@@ -299,7 +299,7 @@ def build_ui_app(
     @router.get("/logs", response_class=HTMLResponse)
     async def logs_page(request: Request) -> HTMLResponse:
         """Render the live log stream page."""
-        return templates.TemplateResponse("logs.html", {"request": request})
+        return templates.TemplateResponse(request, "logs.html", {})
 
     @router.get("/pipeline/{workflow_id}", response_class=HTMLResponse)
     async def pipeline_page(request: Request, workflow_id: int) -> HTMLResponse:
@@ -309,8 +309,9 @@ def build_ui_app(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
         return templates.TemplateResponse(
+            request,
             "pipeline.html",
-            {"request": request, "workflow": wf},
+            {"workflow": wf},
         )
 
     @router.get("/pipeline/{workflow_id}/fragment", response_class=HTMLResponse)
@@ -359,9 +360,9 @@ def build_ui_app(
         jobs_data = [dict(j) for j in jobs]
 
         return templates.TemplateResponse(
+            request,
             "pipeline_fragment.html",
             {
-                "request": request,
                 "workflow": wf,
                 "phase_data": phase_data,
                 "decisions": decisions_parsed,

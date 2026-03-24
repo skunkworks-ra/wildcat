@@ -59,6 +59,7 @@ podman run -d \
     -v /usr/lib/wsl:/usr/lib/wsl:ro \
     -e LD_LIBRARY_PATH=/usr/lib/wsl/lib \
     -e WILDCAT_MS_PATH="$CONTAINER_MS" \
+    -e WILDCAT_AUTOSTART=1 \
     -v "$MS_INSPECT_SRC":/opt/ms-inspect:ro \
     -v "$SKILLS_SRC":/skills/radio-interferometry:ro \
     -v "$(dirname "$MS_PATH")":/data/ms:ro \
@@ -156,29 +157,30 @@ async def main():
 asyncio.run(main())
 EOF
 
-# ── Step 7: Wait for wildcat to reach HUMAN_CHECKPOINT ───────────────────────
-step "Waiting for wildcat to reach HUMAN_CHECKPOINT"
+# ── Step 7: Wait for wildcat to reach a checkpoint or terminal state ─────────
+step "Waiting for wildcat to reach CALIBRATION_CHECKPOINT (or terminal state)"
 
-for i in $(seq 1 120); do
+for i in $(seq 1 240); do
     STAGE=$(python3 -c "
 import sqlite3
 con = sqlite3.connect('/home/pjaganna/Data/wildcat-output/wildcat.db')
 row = con.execute('SELECT stage FROM workflow ORDER BY id DESC LIMIT 1').fetchone()
 print(row[0] if row else 'NONE')
 " 2>/dev/null)
-    echo "  stage: $STAGE ($i/120)"
-    if [ "$STAGE" = "HUMAN_CHECKPOINT" ]; then
-        # Verify checkpoint row exists
-        HAS_CP=$(python3 -c "
+    echo "  stage: $STAGE ($i/240)"
+    case "$STAGE" in
+        CALIBRATION_CHECKPOINT|HUMAN_CHECKPOINT|IMAGING_PIPELINE|STOPPED|ERROR)
+            HAS_CP=$(python3 -c "
 import sqlite3
 con = sqlite3.connect('/home/pjaganna/Data/wildcat-output/wildcat.db')
 row = con.execute('SELECT id FROM checkpoints ORDER BY id DESC LIMIT 1').fetchone()
 print(row[0] if row else 'none')
 " 2>/dev/null)
-        echo "  checkpoint id: $HAS_CP"
-        break
-    fi
-    if [ "$i" -eq 120 ]; then
+            echo "  reached $STAGE (checkpoint id: $HAS_CP)"
+            break
+            ;;
+    esac
+    if [ "$i" -eq 240 ]; then
         warn "Timed out — wildcat logs:"
         podman exec wildcat-test cat /var/log/wildcat.log | tail -20
     fi

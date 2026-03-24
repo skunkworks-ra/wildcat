@@ -28,6 +28,6 @@ path = "/skills/radio-interferometry"   # mounted from ms-inspect repo
 db_path = "/data/wildcat.db"
 
 [casa]
-executable = "casa"
-args       = ["--nologger", "--nogui", "-c"]
+executable = "python3"
+args       = []
 jobs_dir   = "/data/jobs"
