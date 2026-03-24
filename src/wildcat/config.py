@@ -21,6 +21,7 @@ class LlamaCppConfig:
     n_gpu_layers: int
     threads: int
     temp: float
+    max_tokens: int
     extra_args: list[str]
 
 
@@ -107,6 +108,7 @@ def load_config(path: str | Path = "config.toml") -> WildcatConfig:
                 n_gpu_layers=llamacpp_raw["n_gpu_layers"],
                 threads=llamacpp_raw["threads"],
                 temp=llamacpp_raw["temp"],
+                max_tokens=llamacpp_raw.get("max_tokens", 4096),
                 extra_args=llamacpp_raw.get("extra_args", []),
             ),
             ollama=OllamaConfig(

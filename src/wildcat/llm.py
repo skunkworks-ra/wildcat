@@ -88,6 +88,7 @@ class LLMBackend:
             model=self.config.active_model,
             messages=messages,
             temperature=self.config.llamacpp.temp if self.config.backend == "llamacpp" else 0.0,
+            max_tokens=self.config.llamacpp.max_tokens if self.config.backend == "llamacpp" else 4096,
         )
         # Return as dict for uniform handling downstream
         return response.model_dump()

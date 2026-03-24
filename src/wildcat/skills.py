@@ -1,7 +1,9 @@
 """Skill document loader and system prompt assembler.
 
-Radio interferometry skill partials live in the ms-inspect repo under
+Radio interferometry skill partials live in the data-analyst repo under
   .claude/skills/radio-interferometry/
+
+and are volume-mounted into the container at /skills/radio-interferometry.
 
 They are concatenated in a stage-dependent order so the small LLM
 receives only the knowledge relevant to the current decision point —
@@ -30,19 +32,26 @@ _STAGE_EXTRAS: dict[str, list[str]] = {
     "phase2":      ["03-instrument-sanity.md"],
     "phase3":      ["04-diagnostic-reasoning.md", "05-calibrator-science.md"],
     "checkpoint":  ["04-diagnostic-reasoning.md", "06-failure-modes.md"],
+    "calibration": ["05-calibrator-science.md", "07-calibration-execution.md", "08-pband-specifics.md"],
+    "polcal":      ["05-calibrator-science.md", "09-polcal-execution.md"],
 }
 
 # Map Stage enum values to stage groups
 _STAGE_TO_GROUP: dict[Stage, str] = {
-    Stage.PHASE1_RUNNING:   "phase1",
-    Stage.PHASE1_COMPLETE:  "phase1",
-    Stage.PHASE2_RUNNING:   "phase2",
-    Stage.PHASE2_COMPLETE:  "phase2",
-    Stage.PHASE3_RUNNING:   "phase3",
-    Stage.PHASE3_COMPLETE:  "phase3",
-    Stage.HUMAN_CHECKPOINT: "checkpoint",
-    Stage.CALIBRATION_LOOP: "checkpoint",
-    Stage.IMAGING_PIPELINE: "checkpoint",
+    Stage.PHASE1_RUNNING:        "phase1",
+    Stage.PHASE1_COMPLETE:       "phase1",
+    Stage.PHASE2_RUNNING:        "phase2",
+    Stage.PHASE2_COMPLETE:       "phase2",
+    Stage.PHASE3_RUNNING:        "phase3",
+    Stage.PHASE3_COMPLETE:       "phase3",
+    Stage.HUMAN_CHECKPOINT:      "checkpoint",
+    Stage.IMAGING_PIPELINE:      "checkpoint",
+    Stage.CALIBRATION_PREFLAG:   "calibration",
+    Stage.CALIBRATION_SOLVE:     "calibration",
+    Stage.CALIBRATION_APPLY:     "calibration",
+    Stage.POLCAL_SOLVE:          "polcal",
+    Stage.CALIBRATION_CHECKPOINT: "calibration",
+    Stage.CALIBRATION_LOOP:      "calibration",
 }
 
 

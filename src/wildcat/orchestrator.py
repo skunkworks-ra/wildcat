@@ -6,7 +6,7 @@ The Orchestrator drives the workflow state machine:
 
 The LLM is invoked once per decision point (stateless between calls).
 Long CASA jobs don't cause timeouts because the orchestrator awaits
-an asyncio.Event set by SentinelWatcher, not a HTTP response.
+asyncio subprocesses directly — the event loop stays idle while CASA runs.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 
 from wildcat.llm import LLMBackend
@@ -26,37 +27,39 @@ from wildcat.tools import MSInspectClient
 log = logging.getLogger(__name__)
 
 # JSON schema that every LLM response must conform to
-_DECISION_SCHEMA_KEYS = {"next_stage", "casa_script", "summary", "reasoning"}
+_DECISION_SCHEMA_KEYS = {"next_stage", "summary", "reasoning"}  # casa_script is optional
 
 # ── Per-stage JSON instructions ─────────────────────────────────────────────
 
-# Inspection phases (Phase 1-3): full schema with optional checkpoint_questions
+# Inspection phases 1 and 2: advance to next phase or escalate on critical failure
 _JSON_INSTRUCTION = """
 Respond with a single JSON object and no other text. Schema:
 {
   "next_stage": "<one of: PHASE2_RUNNING, PHASE3_RUNNING, HUMAN_CHECKPOINT, ERROR>",
   "casa_script": "<python script string, or null if no CASA job is needed>",
   "summary": "<human-readable summary of your findings (2-5 sentences)>",
-  "reasoning": "<brief reasoning trace explaining the decision>",
-  "checkpoint_questions": [
-    {
-      "id": "polcal",
-      "finding": "<one sentence about polarisation calibration feasibility>",
-      "severity": "<info|warning|critical>",
-      "question": "<question to ask the human expert about polarisation calibration>",
-      "options": ["continue_polcal", "stokes_i_only", "exit"]
-    },
-    {
-      "id": "aggressive_flagging",
-      "finding": "<one sentence about flagging issues e.g. bad antennas or RFI>",
-      "severity": "<info|warning|critical>",
-      "question": "<yes/no question about whether to apply aggressive flagging>",
-      "options": ["yes", "no"]
-    }
-  ]
+  "reasoning": "<brief reasoning trace explaining the decision>"
 }
-The checkpoint_questions array is ONLY included when next_stage is HUMAN_CHECKPOINT. Omit it otherwise.
-Always include both questions (polcal and aggressive_flagging) when emitting checkpoint_questions.
+Only choose HUMAN_CHECKPOINT or ERROR for unrecoverable critical failures.
+Normal observations should advance to the next phase.
+"""
+
+# Phase 3: autonomous decision — always proceed to calibration unless data is fundamentally broken
+_JSON_INSTRUCTION_PHASE3 = """
+Respond with a single JSON object and no other text. Schema:
+{
+  "next_stage": "<CALIBRATION_PREFLAG | ERROR>",
+  "summary": "<human-readable summary of your findings (2-5 sentences)>",
+  "reasoning": "<brief reasoning trace explaining the decision>"
+}
+
+Always choose CALIBRATION_PREFLAG.
+Only choose ERROR for fundamental data corruption (all calibrators missing or entirely flagged,
+no usable data whatsoever).
+
+Do NOT include polcal or aggressive_flagging decisions — these are set automatically by the
+orchestrator from ms_pol_cal_feasibility (verdict) and ms_antenna_flag_fraction (per-antenna
+flag fractions). Do NOT include checkpoint_questions or config_updates.
 """
 
 # CALIBRATION_PREFLAG: rflag pass on calibrators, decide if clean enough to solve
@@ -73,51 +76,45 @@ Choose CALIBRATION_PREFLAG for another rflag pass when data is still heavily con
 Maximum 3 CALIBRATION_PREFLAG passes — the orchestrator enforces this cap.
 """
 
-# CALIBRATION_SOLVE: delay+BP+gain sequence, flag BP solutions, report metrics
-_JSON_INSTRUCTION_SOLVE = """
-Respond with a single JSON object and no other text. Schema:
-{
-  "next_stage": "<CALIBRATION_PREFLAG | CALIBRATION_APPLY>",
-  "casa_script": "<completed CASA Python script — fill ALL {PLACEHOLDER} values>",
-  "summary": "<bp_flagged_frac and gain_flagged_frac you found and what you decided>",
-  "reasoning": "<brief trace>"
-}
-Choose CALIBRATION_APPLY when bp_flagged_frac < 0.20 AND gain_flagged_frac < 0.15.
-Choose CALIBRATION_PREFLAG when solutions are too heavily flagged and more RFI excision is needed.
-"""
-
-# CALIBRATION_APPLY: applycal + rflag corrected + flag target, then checkpoint
+# CALIBRATION_APPLY: metrics summary + checkpoint questions only.
+# The CASA script is filled deterministically — LLM only interprets the results for the human.
 _JSON_INSTRUCTION_APPLY = """
+The CASA calibration script has already run. You are given the WILDCAT_METRICS output.
 Respond with a single JSON object and no other text. Schema:
 {
-  "next_stage": "CALIBRATION_CHECKPOINT",
-  "casa_script": "<completed CASA Python script — fill ALL {PLACEHOLDER} values>",
-  "summary": "<what applycal did and post-cal flag fractions on corrected data>",
-  "reasoning": "<brief trace>",
+  "summary": "<2-5 sentences summarising calibration quality using the actual metric values>",
   "checkpoint_questions": [
     {
-      "id": "bp_quality",
-      "finding": "<actual bp_flagged_frac value and what it means for data quality>",
+      "id": "calibration_done",
+      "finding": "<one sentence with actual values: bp_flagged_frac=X, gain_flagged_frac=Y, post_cal_flag_frac=Z, n_antennas_lost=N>",
       "severity": "<info|warning|critical>",
-      "question": "Bandpass solutions: are these acceptable to proceed to imaging?",
-      "options": ["proceed", "loop_back", "exit"]
-    },
-    {
-      "id": "gain_quality",
-      "finding": "<actual gain_flagged_frac and n_antennas_lost from WILDCAT_METRICS>",
-      "severity": "<info|warning|critical>",
-      "question": "Gain solutions: proceed to imaging or re-run calibration?",
+      "question": "Calibration complete. Proceed to imaging or loop back for another calibration pass?",
       "options": ["proceed", "loop_back", "exit"]
     }
   ]
 }
-Always set next_stage to CALIBRATION_CHECKPOINT. Always include both checkpoint_questions with real numbers.
+Use the real metric values from WILDCAT_METRICS. Severity is info if all fractions < 0.20, warning if any 0.20-0.40, critical if any > 0.40.
+"""
+
+# POLCAL_SOLVE: full solve sequence K + G + B + setjy(polcal) + Kcross + Df + Xf
+# Replaces CALIBRATION_SOLVE when polcal=True. CALIBRATION_APPLY follows.
+_JSON_INSTRUCTION_POLCAL = """
+Respond with a single JSON object and no other text. Schema:
+{
+  "next_stage": "CALIBRATION_APPLY",
+  "casa_script": "<completed CASA Python script — fill ALL {PLACEHOLDER} values>",
+  "summary": "<solve steps run, calibrator, bp_flagged_frac, gain_flagged_frac, polindex_c0, polangle_c0_rad>",
+  "reasoning": "<brief trace>"
+}
+Always set next_stage to CALIBRATION_APPLY.
+Fill ALL {PLACEHOLDER} values from Phase 1-3 tool outputs.
+Choose POLTYPE_DTERM using guidance from 09-polcal-execution.md (Df vs Df+QU table).
+POL_FREQ_LO and POL_FREQ_HI should bracket the usable PA nodes — for 3C48 at S-band use 2.0 and 9.0.
 """
 
 _JSON_INSTRUCTIONS_BY_STAGE: dict[Stage, str] = {
     Stage.CALIBRATION_PREFLAG: _JSON_INSTRUCTION_PREFLAG,
-    Stage.CALIBRATION_SOLVE:   _JSON_INSTRUCTION_SOLVE,
-    Stage.CALIBRATION_APPLY:   _JSON_INSTRUCTION_APPLY,
+    Stage.POLCAL_SOLVE:        _JSON_INSTRUCTION_POLCAL,
 }
 
 # ── Config mapping ────────────────────────────────────────────────────────────
@@ -139,8 +136,7 @@ _QUESTION_CONFIG_MAP: dict[str, dict[str, tuple[str, object] | None]] = {
         "loop_back": ("aggressive_flagging", False),   # LLM fallback
     },
     # Calibration checkpoint — routing only, no config updates
-    "bp_quality":   {"proceed": None, "loop_back": None, "exit": None},
-    "gain_quality":  {"proceed": None, "loop_back": None, "exit": None},
+    "calibration_done": {"proceed": None, "loop_back": None, "exit": None},
 }
 
 # ── CASA script templates ────────────────────────────────────────────────────
@@ -148,16 +144,23 @@ _QUESTION_CONFIG_MAP: dict[str, dict[str, tuple[str, object] | None]] = {
 # Sections marked [DETERMINISTIC] must be copied verbatim.
 
 _TEMPLATE_PREFLAG = """\
-# wildcat CALIBRATION_PREFLAG — rflag calibrators, report flag fractions
+# wildcat CALIBRATION_PREFLAG — split calibrators, rflag, report flag fractions
 # LLM: fill all {PLACEHOLDER} values from Phase 1-3 tool outputs
 
-import json
-from casatasks import flagdata
+import json, os
+from casatasks import split, flagdata
 
-vis          = '{VIS}'           # absolute path to the measurement set
+original_ms  = '{VIS}'          # original read-only measurement set
 cal_fields   = '{CAL_FIELDS}'   # comma-sep field IDs for all calibrators, e.g. '0,1,2'
 all_spw      = '{ALL_SPW}'      # e.g. '0~15'
 corrstring   = '{CORRSTRING}'   # e.g. 'RR,LL' or 'XX,YY'
+
+workdir = '/data/jobs/{WORKFLOW_ID}'
+
+# [DETERMINISTIC] Split calibrators to writable working copy (idempotent)
+vis = workdir + '/calibrators.ms'
+if not os.path.exists(vis):
+    split(vis=original_ms, outputvis=vis, field=cal_fields, datacolumn='data', keepflags=True)
 
 # [DETERMINISTIC] rflag on calibrators
 flagdata(
@@ -167,7 +170,7 @@ flagdata(
     ntime='scan', combinescans=False,
     datacolumn='data',
     winsize=3, timedevscale=4.0, freqdevscale=4.0,
-    extendflags=False, action='apply', flagbackup=True,
+    extendflags=False, action='apply', flagbackup=False,
 )
 
 # [DETERMINISTIC] Extend flags to full polarisation products
@@ -201,26 +204,24 @@ print('WILDCAT_METRICS: ' + json.dumps(metrics))
 
 _TEMPLATE_SOLVE = """\
 # wildcat CALIBRATION_SOLVE — delay+BP+gain, flag BP solutions, report metrics
-# LLM: fill all {PLACEHOLDER} values from Phase 1-3 tool outputs
+# All values filled deterministically by the orchestrator from Phase 1-3 tool outputs.
 
 import json
 from casatools import ms as mstool
 from casatasks import gaincal, bandpass, flagdata, rmtables
 
-vis           = '{VIS}'
+workdir       = '/data/jobs/{WORKFLOW_ID}'
+vis           = workdir + '/calibrators.ms'  # [DETERMINISTIC] split from CALIBRATION_PREFLAG
 flux_field    = '{FLUX_FIELD}'        # field ID(s) for flux calibrator
 bp_field      = '{BP_FIELD}'          # field ID(s) for bandpass calibrator
 delay_field   = '{DELAY_FIELD}'       # field ID(s) for delay calibrator
 phase_field   = '{PHASE_FIELD}'       # field ID(s) for phase calibrator
-phase_scans   = '{PHASE_SCAN_IDS}'   # comma-sep scan IDs on phase cal, e.g. '5,10,15'
-refant        = '{REFANT}'            # reference antenna name, e.g. 'ea01'
+phase_scans   = '{PHASE_SCAN_IDS}'   # comma-sep scan IDs on phase cal
+refant        = '{REFANT}'            # reference antenna (lowest flag fraction)
 all_spw       = '{ALL_SPW}'
-corrstring    = '{CORRSTRING}'
-flux_standard = '{FLUX_STANDARD}'    # e.g. 'Perley-Butler 2017'
-minblperant   = {MINBLPERANT}         # int, e.g. 4
-int_time_s    = {INT_TIME_S}          # integration time in seconds, e.g. 2.02
-
-workdir = '/data/jobs/{WORKFLOW_ID}'
+flux_standard = '{FLUX_STANDARD}'    # CASA-accepted standard string
+minblperant   = {MINBLPERANT}
+int_time_s    = {INT_TIME_S}          # integration time in seconds
 
 # [DETERMINISTIC] Set flux density scale
 from casatasks import setjy
@@ -284,13 +285,12 @@ bandpass(
 )
 
 # [DETERMINISTIC] Flag bad bandpass solutions with rflag
-bp_flag_before = flagdata(caltable=t_bp, mode='summary', action='calculate')
 flagdata(
     vis=t_bp, mode='rflag',
     winsize=3, timedevscale=4.0, freqdevscale=4.0,
     action='apply', flagbackup=False,
 )
-bp_flag_after = flagdata(caltable=t_bp, mode='summary', action='calculate')
+bp_flag_after = flagdata(vis=t_bp, mode='summary', action='calculate')
 bp_flagged_frac = bp_flag_after.get('flagged', 0) / max(bp_flag_after.get('total', 1), 1)
 
 # [DETERMINISTIC] Final amplitude+phase gain solutions
@@ -301,7 +301,7 @@ gaincal(
     refant=refant, minblperant=minblperant, minsnr=3.0,
     gaintable=[t_delay, t_bp], gainfield=['', ''], interp=['', 'linear'],
 )
-gain_flag_after = flagdata(caltable=t_gain, mode='summary', action='calculate')
+gain_flag_after = flagdata(vis=t_gain, mode='summary', action='calculate')
 gain_flagged_frac = gain_flag_after.get('flagged', 0) / max(gain_flag_after.get('total', 1), 1)
 
 # Count antennas that are completely flagged in the gain table
@@ -313,7 +313,7 @@ flag_col = tb.getcol('FLAG')
 tb.close()
 import numpy as np
 unique_ants = set(ant_col.tolist())
-lost_ants = sum(1 for a in unique_ants if flag_col[ant_col == a].all())
+lost_ants = sum(1 for a in unique_ants if flag_col[..., ant_col == a].all())
 
 # [DETERMINISTIC] Emit metrics
 metrics = {
@@ -331,31 +331,42 @@ print('WILDCAT_METRICS: ' + json.dumps(metrics))
 """
 
 _TEMPLATE_APPLY = """\
-# wildcat CALIBRATION_APPLY — applycal + rflag corrected + flag target
-# LLM: fill all {PLACEHOLDER} values
+# wildcat CALIBRATION_APPLY — single applycal pass (includes polcal tables if present)
+# All values filled deterministically by the orchestrator.
 
 import json
+import os
 from casatasks import applycal, flagdata
 
-vis          = '{VIS}'
-target_field = '{TARGET_FIELD}'    # field ID(s) for science target(s)
-cal_field    = '{CAL_FIELDS}'      # all calibrator field IDs
-all_spw      = '{ALL_SPW}'
-corrstring   = '{CORRSTRING}'
-
-workdir  = '/data/jobs/{WORKFLOW_ID}'
+workdir   = '/data/jobs/{WORKFLOW_ID}'
+vis       = workdir + '/calibrators.ms'  # [DETERMINISTIC] split calibrators only
+cal_field = '{CAL_FIELDS}'               # all calibrator field IDs
+all_spw   = '{ALL_SPW}'
+corrstring = '{CORRSTRING}'              # parallel hands only (e.g. 'XX,YY' or 'RR,LL')
 t_delay  = workdir + '/delay.cal'
 t_bp     = workdir + '/bandpass.cal'
 t_gain   = workdir + '/gain.cal'
+t_kcross = workdir + '/kcross.K'
+t_dterm  = workdir + '/dterms.D'
+t_xfeed  = workdir + '/polangle.X'
+
+# [DETERMINISTIC] Build gaintable list — include polcal tables only if they exist
+_base_tables = [t_delay, t_bp, t_gain]
+_polcal_tables = [t for t in [t_kcross, t_dterm, t_xfeed] if os.path.exists(t)]
+all_gaintable = _base_tables + _polcal_tables
+all_gainfield = [''] * len(all_gaintable)
+all_interp    = ['', 'linear', 'linear'] + [''] * len(_polcal_tables)
+use_parang    = len(_polcal_tables) > 0
 
 # [DETERMINISTIC] Apply calibration to all fields
 applycal(
     vis=vis, field='',
     spw=all_spw,
-    gaintable=[t_delay, t_bp, t_gain],
-    gainfield=['', '', ''],
-    interp=['', 'linear', 'linear'],
-    calwt=[False, False, False],
+    gaintable=all_gaintable,
+    gainfield=all_gainfield,
+    interp=all_interp,
+    calwt=[False] * len(all_gaintable),
+    parang=use_parang,
     flagbackup=True,
 )
 
@@ -367,17 +378,6 @@ flagdata(
     ntime='scan', combinescans=False,
     datacolumn='corrected',
     winsize=3, timedevscale=4.0, freqdevscale=4.0,
-    extendflags=False, action='apply', flagbackup=False,
-)
-
-# [DETERMINISTIC] rflag on target corrected column
-flagdata(
-    vis=vis, mode='rflag',
-    field=target_field, spw=all_spw,
-    correlation='ABS_' + corrstring,
-    ntime='scan', combinescans=False,
-    datacolumn='corrected',
-    winsize=3, timedevscale=5.0, freqdevscale=5.0,
     extendflags=False, action='apply', flagbackup=False,
 )
 
@@ -403,21 +403,243 @@ metrics = {
 print('WILDCAT_METRICS: ' + json.dumps(metrics))
 """
 
+_TEMPLATE_POLCAL = """\
+# wildcat POLCAL_SOLVE — full solve: K + G + B + setjy(polcal) + Kcross + Df + Xf
+# Replaces CALIBRATION_SOLVE when polcal=True. CALIBRATION_APPLY follows.
+# LLM: fill all {PLACEHOLDER} values from Phase 1-3 tool outputs.
+# See 07-calibration-execution.md for K/G/B guidance, 09-polcal-execution.md for Df vs Df+QU.
+
+import json
+from casatools import ms as mstool
+from casatasks import setjy, gaincal, bandpass, polcal, flagdata, rmtables
+from ms_inspect.util.polcal_setjy_fit import fit_from_catalogue
+
+vis               = '{VIS}'
+flux_field        = '{FLUX_FIELD}'          # field ID(s) for flux calibrator
+bp_field          = '{BP_FIELD}'            # field ID(s) for bandpass calibrator
+delay_field       = '{DELAY_FIELD}'         # field ID(s) for delay calibrator
+phase_field       = '{PHASE_FIELD}'         # field ID(s) for phase calibrator
+phase_scans       = '{PHASE_SCAN_IDS}'      # comma-sep scan IDs on phase cal
+angle_cal_field   = '{ANGLE_CAL_FIELD}'     # field name for polcal angle calibrator (e.g. '3C48')
+leakage_cal_field = '{LEAKAGE_CAL_FIELD}'   # usually same as angle_cal_field
+refant            = '{REFANT}'
+all_spw           = '{ALL_SPW}'
+flux_standard     = '{FLUX_STANDARD}'
+minblperant       = {MINBLPERANT}
+int_time_s        = {INT_TIME_S}
+
+calibrator_name   = '{CALIBRATOR_NAME}'  # catalogue b1950 name (from ms_pol_cal_feasibility)
+reffreq_ghz       = {REFFREQ_GHZ}        # float — band_centre_ghz from ms_pol_cal_feasibility
+pol_freq_lo       = {POL_FREQ_LO}        # float — lower GHz bound for pol fit (e.g. 2.0 for S-band)
+pol_freq_hi       = {POL_FREQ_HI}        # float — upper GHz bound for pol fit (e.g. 9.0 for S-band)
+poltype_dterm     = '{POLTYPE_DTERM}'    # 'Df' or 'Df+QU' — see 09-polcal-execution.md
+
+workdir  = '/data/jobs/{WORKFLOW_ID}'
+t_delay  = workdir + '/delay.cal'
+t_initph = workdir + '/initphase.cal'
+t_bp     = workdir + '/bandpass.cal'
+t_gain   = workdir + '/gain.cal'
+t_kcross = workdir + '/kcross.K'
+t_dterm  = workdir + '/dterms.D'
+t_xfeed  = workdir + '/polangle.X'
+for t in [t_delay, t_initph, t_bp, t_gain, t_kcross, t_dterm, t_xfeed]:
+    rmtables(t)
+
+# [DETERMINISTIC] Set flux density scale (Stokes I only — polcal model set below)
+setjy(vis=vis, field=flux_field, scalebychan=True, standard=flux_standard)
+
+# [DETERMINISTIC] Compute solution intervals from phase-cal scan durations
+_DAY_S = 86400.0
+ms_tool = mstool()
+ms_tool.open(vis)
+scan_summary = ms_tool.getscansummary()
+ms_tool.close()
+
+phase_scan_ids = [int(s.strip()) for s in phase_scans.split(',') if s.strip()]
+durations = []
+for sid in phase_scan_ids:
+    sd = scan_summary.get(str(sid), {})
+    for sub in sd.values():
+        t_end = sub.get('EndTime', 0.0)
+        t_beg = sub.get('BeginTime', 0.0)
+        if t_end > t_beg:
+            durations.append(_DAY_S * (t_end - t_beg))
+            break
+
+gain_solint1 = f'{int_time_s:.2f}s'
+gain_solint2 = f'{(max(durations) * 1.01 if durations else 30.0):.2f}s'
+
+# [DETERMINISTIC] Delay calibration
+gaincal(
+    vis=vis, caltable=t_delay,
+    field=delay_field, spw=all_spw,
+    gaintype='K', solint='inf', combine='scan',
+    refant=refant, minblperant=minblperant, minsnr=3.0,
+)
+
+# [DETERMINISTIC] Initial per-integration phase (de-smear bandpass)
+gaincal(
+    vis=vis, caltable=t_initph,
+    field=bp_field, spw=all_spw,
+    gaintype='G', calmode='p', solint=gain_solint1,
+    refant=refant, minblperant=minblperant, minsnr=3.0,
+    gaintable=[t_delay], gainfield=[''], interp=[''],
+)
+
+# [DETERMINISTIC] Bandpass
+bandpass(
+    vis=vis, caltable=t_bp,
+    field=bp_field, spw=all_spw,
+    solint='inf', combine='scan',
+    refant=refant, minblperant=minblperant, minsnr=3.0,
+    bandtype='B', fillgaps=62,
+    gaintable=[t_delay, t_initph], gainfield=['', ''], interp=['', ''],
+)
+
+# [DETERMINISTIC] Flag bad bandpass solutions
+bp_flag_before = flagdata(caltable=t_bp, mode='summary', action='calculate')
+flagdata(vis=t_bp, mode='rflag', winsize=3, timedevscale=4.0, freqdevscale=4.0,
+         action='apply', flagbackup=False)
+bp_flag_after = flagdata(caltable=t_bp, mode='summary', action='calculate')
+bp_flagged_frac = bp_flag_after.get('flagged', 0) / max(bp_flag_after.get('total', 1), 1)
+
+# [DETERMINISTIC] Amplitude+phase gain solutions
+gaincal(
+    vis=vis, caltable=t_gain,
+    field=phase_field, spw=all_spw,
+    gaintype='G', calmode='ap', solint=gain_solint2,
+    refant=refant, minblperant=minblperant, minsnr=3.0,
+    gaintable=[t_delay, t_bp], gainfield=['', ''], interp=['', 'linear'],
+)
+gain_flag_after = flagdata(vis=t_gain, mode='summary', action='calculate')
+gain_flagged_frac = gain_flag_after.get('flagged', 0) / max(gain_flag_after.get('total', 1), 1)
+
+# [DETERMINISTIC] Set full polarisation calibrator model (Stokes I + polindex + polangle)
+pol_freq_range = (pol_freq_lo, pol_freq_hi)
+params = fit_from_catalogue(
+    calibrator_name,
+    reffreq_ghz=reffreq_ghz,
+    pol_freq_range_ghz=pol_freq_range,
+)
+setjy(
+    vis=vis,
+    field=angle_cal_field,
+    standard='manual',
+    fluxdensity=[params.flux_jy, 0, 0, 0],
+    spix=params.spix,
+    reffreq=f'{reffreq_ghz}GHz',
+    polindex=params.polindex,
+    polangle=params.polangle,
+    scalebychan=True,
+    usescratch=True,
+)
+
+# [DETERMINISTIC] Cross-hand delay (multiband combine for wideband SNR)
+gaincal(
+    vis=vis, caltable=t_kcross,
+    field=angle_cal_field,
+    gaintype='KCROSS',
+    solint='inf', combine='scan,spw',
+    refant=refant,
+    smodel=[1, 0, 1, 0],
+    gaintable=[t_delay, t_bp, t_gain],
+    parang=True,
+)
+
+# [DETERMINISTIC] D-term leakage (Df or Df+QU per 09-polcal-execution.md decision table)
+polcal(
+    vis=vis, caltable=t_dterm,
+    field=leakage_cal_field,
+    poltype=poltype_dterm,
+    solint='inf', combine='scan',
+    refant=refant,
+    gaintable=[t_delay, t_bp, t_gain, t_kcross],
+    parang=True,
+)
+
+# [DETERMINISTIC] Position angle calibration
+polcal(
+    vis=vis, caltable=t_xfeed,
+    field=angle_cal_field,
+    poltype='Xf',
+    solint='inf', combine='scan',
+    refant=refant,
+    gaintable=[t_delay, t_bp, t_gain, t_kcross, t_dterm],
+    parang=True,
+)
+
+# [DETERMINISTIC] Emit metrics
+from casatools import table as tbtool
+tb = tbtool()
+tb.open(t_gain)
+ant_col  = tb.getcol('ANTENNA1')
+flag_col = tb.getcol('FLAG')
+tb.close()
+import numpy as np
+unique_ants = set(ant_col.tolist())
+lost_ants   = sum(1 for a in unique_ants if flag_col[ant_col == a].all())
+
+metrics = {
+    'stage':             'POLCAL_SOLVE',
+    'gain_solint1':      gain_solint1,
+    'gain_solint2':      gain_solint2,
+    'bp_flagged_frac':   round(bp_flagged_frac, 4),
+    'gain_flagged_frac': round(gain_flagged_frac, 4),
+    'n_antennas_lost':   int(lost_ants),
+    'calibrator':        calibrator_name,
+    'reffreq_ghz':       reffreq_ghz,
+    'polindex_c0':       round(params.polindex[0], 6),
+    'polangle_c0_rad':   round(params.polangle[0], 6),
+    't_delay':           t_delay,
+    't_bp':              t_bp,
+    't_gain':            t_gain,
+    't_kcross':          t_kcross,
+    't_dterm':           t_dterm,
+    't_xfeed':           t_xfeed,
+}
+print('WILDCAT_METRICS: ' + json.dumps(metrics))
+"""
+
 _TEMPLATES_BY_STAGE: dict[Stage, str] = {
     Stage.CALIBRATION_PREFLAG: _TEMPLATE_PREFLAG,
-    Stage.CALIBRATION_SOLVE:   _TEMPLATE_SOLVE,
-    Stage.CALIBRATION_APPLY:   _TEMPLATE_APPLY,
+    Stage.POLCAL_SOLVE:        _TEMPLATE_POLCAL,
 }
 
-# Valid next_stage values per calibration stage
+# Valid next_stage values per calibration stage (LLM-driven stages only)
 _VALID_CAL_NEXT_STAGES: dict[Stage, set[str]] = {
     Stage.CALIBRATION_PREFLAG: {Stage.CALIBRATION_PREFLAG.value, Stage.CALIBRATION_SOLVE.value},
-    Stage.CALIBRATION_SOLVE:   {Stage.CALIBRATION_PREFLAG.value, Stage.CALIBRATION_APPLY.value},
-    Stage.CALIBRATION_APPLY:   {Stage.CALIBRATION_CHECKPOINT.value},
+    Stage.POLCAL_SOLVE:        {Stage.CALIBRATION_APPLY.value},
 }
+
+# Polcal feasibility verdicts that allow entering POLCAL_SOLVE
+_POLCAL_VIABLE_VERDICTS = {"FULL", "DEGRADED"}
 
 # Maximum preflag iterations before escalating to CALIBRATION_CHECKPOINT
 _PREFLAG_MAX_ITERATIONS = 3
+
+# If overall flag fraction exceeds this after a preflag pass, stop looping and proceed to solve.
+# At P-band, >50% flagging is endemic RFI — more flagging destroys more data than it saves.
+_PREFLAG_FLAG_CAP = 0.50
+
+# Tool outputs needed per calibration stage — only relevant tools are sent to the LLM.
+# Decision context (loop/proceed) comes from workflow_config and prev_metrics, not tool dumps.
+_CAL_STAGE_TOOLS: dict[Stage, set[str]] = {
+    Stage.CALIBRATION_PREFLAG: {
+        "ms_field_list",
+        "ms_spectral_window_list",
+        "ms_correlator_config",
+    },
+    Stage.POLCAL_SOLVE: {
+        "ms_observation_info",
+        "ms_field_list",
+        "ms_scan_list",
+        "ms_scan_intent_summary",
+        "ms_spectral_window_list",
+        "ms_correlator_config",
+        "ms_refant",
+        "ms_pol_cal_feasibility",
+    },
+}
 
 
 class Orchestrator:
@@ -442,65 +664,81 @@ class Orchestrator:
     # ── Main loop ──────────────────────────────────────────────────────────
 
     async def run(self, workflow_id: int) -> None:
-        """Main loop. Reads stage, dispatches to correct handler, exits on terminal/waiting state."""
+        """Main loop. Reads stage, dispatches to correct handler, exits on terminal state."""
         while True:
             wf = self.db.get_workflow(workflow_id)
             stage = Stage(wf["stage"])
             log.info("Workflow %d: stage=%s", workflow_id, stage)
 
-            if stage == Stage.IDLE:
-                self.db.transition(workflow_id, Stage.PHASE1_RUNNING)
+            try:
+                if stage == Stage.IDLE:
+                    self.db.transition(workflow_id, Stage.PHASE1_RUNNING)
 
-            elif stage == Stage.PHASE1_RUNNING:
-                await self._handle_phase(workflow_id, phase=1)
+                elif stage == Stage.PHASE1_RUNNING:
+                    await self._handle_phase(workflow_id, phase=1)
 
-            elif stage == Stage.PHASE2_RUNNING:
-                await self._handle_phase(workflow_id, phase=2)
+                elif stage == Stage.PHASE2_RUNNING:
+                    await self._handle_phase(workflow_id, phase=2)
 
-            elif stage == Stage.PHASE3_RUNNING:
-                await self._handle_phase(workflow_id, phase=3)
+                elif stage == Stage.PHASE3_RUNNING:
+                    await self._handle_phase(workflow_id, phase=3)
 
-            elif stage == Stage.HUMAN_CHECKPOINT:
-                await self._handle_checkpoint(workflow_id)
+                elif stage == Stage.HUMAN_CHECKPOINT:
+                    await self._handle_checkpoint(workflow_id)
 
-            elif stage in (Stage.CALIBRATION_PREFLAG, Stage.CALIBRATION_SOLVE, Stage.CALIBRATION_APPLY):
-                await self._handle_calibration_stage(workflow_id, stage)
+                elif stage == Stage.CALIBRATION_SOLVE:
+                    await self._handle_solve_stage(workflow_id)
 
-            elif stage == Stage.CALIBRATION_CHECKPOINT:
-                await self._handle_checkpoint(workflow_id)
+                elif stage == Stage.CALIBRATION_APPLY:
+                    await self._handle_apply_stage(workflow_id)
 
-            elif stage == Stage.CALIBRATION_LOOP:
-                # Reset preflag iteration counter and restart calibration
-                wf_config = self.db.get_workflow_config(workflow_id)
-                wf_config["_preflag_iterations"] = 0
-                wf_config.pop("_preflag_flag_warning", None)
-                self.db.set_workflow_config(workflow_id, wf_config)
-                self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
+                elif stage in (
+                    Stage.CALIBRATION_PREFLAG,
+                    Stage.POLCAL_SOLVE,
+                ):
+                    await self._handle_calibration_stage(workflow_id, stage)
 
-            elif stage == Stage.IMAGING_PIPELINE:
-                log.info("Workflow %d reached IMAGING_PIPELINE — handoff complete", workflow_id)
-                break
+                elif stage == Stage.CALIBRATION_CHECKPOINT:
+                    await self._handle_checkpoint(workflow_id)
 
-            elif stage == Stage.STOPPED:
-                log.info("Workflow %d stopped by user request", workflow_id)
-                break
+                elif stage == Stage.CALIBRATION_LOOP:
+                    wf_config = self.db.get_workflow_config(workflow_id)
+                    wf_config["_preflag_iterations"] = 0
+                    wf_config.pop("_preflag_flag_warning", None)
+                    self.db.set_workflow_config(workflow_id, wf_config)
+                    self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
 
-            elif stage == Stage.ERROR:
-                log.error("Workflow %d is in ERROR state — manual intervention required", workflow_id)
-                break
-
-            else:
-                # PHASE*_COMPLETE — advance to next running state
-                next_stage = {
-                    Stage.PHASE1_COMPLETE: Stage.PHASE2_RUNNING,
-                    Stage.PHASE2_COMPLETE: Stage.PHASE3_RUNNING,
-                    Stage.PHASE3_COMPLETE: Stage.HUMAN_CHECKPOINT,
-                }.get(stage)
-                if next_stage:
-                    self.db.transition(workflow_id, next_stage)
-                else:
-                    log.warning("Unhandled stage %s — stopping", stage)
+                elif stage == Stage.IMAGING_PIPELINE:
+                    log.info("Workflow %d reached IMAGING_PIPELINE — handoff complete", workflow_id)
                     break
+
+                elif stage == Stage.STOPPED:
+                    log.info("Workflow %d stopped by user request", workflow_id)
+                    break
+
+                elif stage == Stage.ERROR:
+                    log.error("Workflow %d is in ERROR state — manual intervention required", workflow_id)
+                    break
+
+                else:
+                    next_stage = {
+                        Stage.PHASE1_COMPLETE: Stage.PHASE2_RUNNING,
+                        Stage.PHASE2_COMPLETE: Stage.PHASE3_RUNNING,
+                        Stage.PHASE3_COMPLETE: Stage.HUMAN_CHECKPOINT,
+                    }.get(stage)
+                    if next_stage:
+                        self.db.transition(workflow_id, next_stage)
+                    else:
+                        log.warning("Unhandled stage %s — stopping", stage)
+                        break
+
+            except Exception:
+                log.exception(
+                    "Unhandled error in stage %s for workflow %d — entering ERROR",
+                    stage, workflow_id,
+                )
+                self.db.transition(workflow_id, Stage.ERROR)
+                break
 
     # ── Inspection phase handler ───────────────────────────────────────────
 
@@ -531,12 +769,12 @@ class Orchestrator:
         if phase > 1:
             wf_config = self.db.get_workflow_config(workflow_id)
             user_content += (
-                "\n\n## Human decisions (workflow_config)\n"
+                "\n\n## Workflow config\n"
                 "```json\n" + json.dumps(wf_config, indent=2) + "\n```\n"
-                "Adjust tool selection and recommendations to reflect these decisions.\n"
             )
+        json_instruction = _JSON_INSTRUCTION_PHASE3 if phase == 3 else _JSON_INSTRUCTION
         messages = [
-            {"role": "system", "content": system_prompt + "\n\n" + _JSON_INSTRUCTION},
+            {"role": "system", "content": system_prompt + "\n\n" + json_instruction},
             {"role": "user",   "content": user_content},
         ]
 
@@ -553,12 +791,14 @@ class Orchestrator:
         model = response.get("model", "unknown")
         self.db.save_llm_decision(workflow_id, stage.value, json.dumps(decision), model, prompt_hash)
 
-        if decision.get("casa_script"):
+        if phase != 3 and decision.get("casa_script"):
             if self.stop_event.is_set():
                 log.info("Stop requested — skipping CASA job in Phase %d", phase)
                 self.db.transition(workflow_id, Stage.STOPPED)
                 return
             await self._run_casa_job(workflow_id, stage.value, decision["casa_script"])
+            if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
+                return
 
         next_stage_str = decision["next_stage"]
         try:
@@ -568,14 +808,87 @@ class Orchestrator:
             self.db.transition(workflow_id, Stage.ERROR)
             return
 
+        # Guard: LLM must not escalate to HUMAN_CHECKPOINT from inspection phases.
+        # Phase 1/2 should advance to the next phase; Phase 3 applies deterministic
+        # config rules and proceeds to calibration.
+        _phase_fallback = {
+            1: Stage.PHASE2_RUNNING,
+            2: Stage.PHASE3_RUNNING,
+            3: Stage.CALIBRATION_PREFLAG,
+        }
+        if next_stage == Stage.HUMAN_CHECKPOINT:
+            fallback = _phase_fallback[phase]
+            log.warning(
+                "Workflow %d: LLM chose HUMAN_CHECKPOINT in Phase %d — overriding to %s",
+                workflow_id, phase, fallback.value,
+            )
+            next_stage = fallback
+
+        if phase == 3:
+            # Apply deterministic config rules after routing is resolved
+            self._apply_deterministic_config(workflow_id)
+
         self.db.transition(workflow_id, next_stage)
+
+    # ── Deterministic config rules ─────────────────────────────────────────
+
+    def _apply_deterministic_config(self, workflow_id: int) -> dict:
+        """Apply rule-based config overrides from Phase 2/3 tool outputs.
+
+        Rules:
+          - ms_pol_cal_feasibility verdict NOT_FEASIBLE or DEGRADED → polcal=False
+          - Any antenna with flag_fraction >= 1.0 → aggressive_flagging=True
+
+        These always override whatever the LLM decided. Returns the overrides dict.
+        """
+        all_outputs = self._load_all_tool_outputs(workflow_id)
+        wf_config = self.db.get_workflow_config(workflow_id)
+        overrides: dict = {}
+
+        # Rule 1: polcal feasibility from dedicated tool
+        verdict = (
+            all_outputs.get("ms_pol_cal_feasibility", {})
+            .get("data", {})
+            .get("verdict", "")
+        )
+        if verdict in ("NOT_FEASIBLE", "DEGRADED") and wf_config.get("polcal", True):
+            wf_config["polcal"] = False
+            overrides["polcal"] = False
+            log.warning(
+                "Workflow %d: polcal=False — ms_pol_cal_feasibility verdict=%r",
+                workflow_id, verdict,
+            )
+
+        # Rule 2: any antenna fully flagged → enable aggressive flagging
+        per_antenna = (
+            all_outputs.get("ms_antenna_flag_fraction", {})
+            .get("data", {})
+            .get("per_antenna", [])
+        )
+        fully_flagged = [
+            a["antenna_name"] for a in per_antenna
+            if a.get("flag_fraction", {}).get("value", 0) >= 1.0
+        ]
+        if fully_flagged and not wf_config.get("aggressive_flagging", False):
+            wf_config["aggressive_flagging"] = True
+            overrides["aggressive_flagging"] = True
+            log.warning(
+                "Workflow %d: aggressive_flagging=True — antennas at 100%%: %s",
+                workflow_id, fully_flagged,
+            )
+
+        if overrides:
+            self.db.set_workflow_config(workflow_id, wf_config)
+            log.info("Workflow %d: deterministic config overrides applied: %s", workflow_id, overrides)
+        return overrides
 
     # ── Calibration stage handler ──────────────────────────────────────────
 
     async def _handle_calibration_stage(self, workflow_id: int, stage: Stage) -> None:
         """Read previous job metrics → LLM fills template → run CASA → transition.
 
-        Shared by CALIBRATION_PREFLAG, CALIBRATION_SOLVE, CALIBRATION_APPLY.
+        Handles LLM-driven calibration stages: CALIBRATION_PREFLAG, POLCAL_SOLVE.
+        CALIBRATION_SOLVE and CALIBRATION_APPLY are handled by their own deterministic handlers.
         """
         if self.stop_event.is_set():
             self.db.transition(workflow_id, Stage.STOPPED)
@@ -596,10 +909,10 @@ class Orchestrator:
             self.db.transition(workflow_id, Stage.CALIBRATION_CHECKPOINT)
             return
 
-        # 1. Build context: previous CASA job metrics + all Phase 1-3 tool outputs + workflow_config
+        # 1. Build context: previous CASA job metrics + relevant Phase 1-3 tool outputs + workflow_config
         prev_metrics = self._read_last_job_metrics(workflow_id)
-        phase_outputs = self._load_all_tool_outputs(workflow_id)
-        template = _TEMPLATES_BY_STAGE[stage]
+        phase_outputs = self._load_all_tool_outputs(workflow_id, tools=_CAL_STAGE_TOOLS.get(stage))
+        template = _TEMPLATES_BY_STAGE[stage].replace('{WORKFLOW_ID}', str(workflow_id))
         instruction = _JSON_INSTRUCTIONS_BY_STAGE[stage]
 
         user_content = self._format_calibration_prompt(
@@ -607,8 +920,9 @@ class Orchestrator:
         )
 
         system_prompt = load_system_prompt(self.skills_path, stage)
+        # /no_think disables Qwen3 chain-of-thought for structured JSON outputs
         messages = [
-            {"role": "system", "content": system_prompt + "\n\n" + instruction},
+            {"role": "system", "content": system_prompt + "\n\n" + instruction + "\n\n/no_think"},
             {"role": "user",   "content": user_content},
         ]
 
@@ -641,6 +955,38 @@ class Orchestrator:
                 self.db.transition(workflow_id, Stage.STOPPED)
                 return
             await self._run_casa_job(workflow_id, stage.value, decision["casa_script"])
+            if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
+                return
+
+        # 4b. Flag fraction cap: if PREFLAG wants to loop but data is too heavily flagged,
+        #     force-advance to CALIBRATION_SOLVE rather than destroying more data.
+        if stage == Stage.CALIBRATION_PREFLAG and next_stage_str == Stage.CALIBRATION_PREFLAG.value:
+            current_metrics = self._read_last_job_metrics(workflow_id)
+            flag_frac = current_metrics.get("overall_flag_frac", 0.0)
+            if isinstance(flag_frac, (int, float)) and flag_frac >= _PREFLAG_FLAG_CAP:
+                log.warning(
+                    "Workflow %d: overall_flag_frac=%.3f >= cap %.2f — forcing CALIBRATION_SOLVE",
+                    workflow_id, flag_frac, _PREFLAG_FLAG_CAP,
+                )
+                next_stage_str = Stage.CALIBRATION_SOLVE.value
+
+        # 4c. Polcal routing: when CALIBRATION_PREFLAG advances to CALIBRATION_SOLVE,
+        #     redirect to POLCAL_SOLVE if polcal=True and feasibility verdict is viable.
+        #     Logs reason when polcal is skipped (NOT_FEASIBLE or LEAKAGE_ONLY).
+        if stage == Stage.CALIBRATION_PREFLAG and next_stage_str == Stage.CALIBRATION_SOLVE.value:
+            if wf_config.get("polcal"):
+                polcal_verdict = self._get_polcal_verdict(workflow_id)
+                if polcal_verdict in _POLCAL_VIABLE_VERDICTS:
+                    log.info(
+                        "Workflow %d: polcal=True, verdict=%s — routing to POLCAL_SOLVE",
+                        workflow_id, polcal_verdict,
+                    )
+                    next_stage_str = Stage.POLCAL_SOLVE.value
+                else:
+                    log.info(
+                        "Workflow %d: polcal=True but verdict=%r — using CALIBRATION_SOLVE",
+                        workflow_id, polcal_verdict,
+                    )
 
         # 5. Update preflag iteration counter
         if stage == Stage.CALIBRATION_PREFLAG:
@@ -652,6 +998,236 @@ class Orchestrator:
 
         # 6. Transition
         self.db.transition(workflow_id, Stage(next_stage_str))
+
+    # ── Deterministic CALIBRATION_SOLVE ───────────────────────────────────
+
+    # Maps the tool-output flux_standard identifier to the CASA-accepted string.
+    _FLUX_STANDARD_MAP: dict[str, str] = {
+        "Perley-Butler-2017":     "Perley-Butler 2017",
+        "Perley-Butler-2013":     "Perley-Butler 2013",
+        "Scaife-Heald-2012":      "Scaife-Heald 2012",
+        "Stevens-Reynolds-2016":  "Stevens-Reynolds 2016",
+    }
+
+    async def _handle_solve_stage(self, workflow_id: int) -> None:
+        """CALIBRATION_SOLVE: fill template deterministically, run CASA, apply threshold rule.
+
+        No LLM call. All placeholders are derived from Phase 1-3 tool outputs.
+        Threshold rule: bp_flagged_frac < 0.20 AND gain_flagged_frac < 0.15 → CALIBRATION_APPLY,
+        otherwise → CALIBRATION_PREFLAG for another flagging pass.
+        """
+        if self.stop_event.is_set():
+            self.db.transition(workflow_id, Stage.STOPPED)
+            return
+
+        script = self._build_solve_script(workflow_id)
+        await self._run_casa_job(workflow_id, Stage.CALIBRATION_SOLVE.value, script)
+        if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
+            return
+
+        metrics = self._read_last_job_metrics(workflow_id)
+        bp_frac   = float(metrics.get("bp_flagged_frac",   1.0))
+        gain_frac = float(metrics.get("gain_flagged_frac", 1.0))
+
+        if bp_frac < 0.20 and gain_frac < 0.15:
+            log.info(
+                "Workflow %d: CALIBRATION_SOLVE passed (bp=%.3f gain=%.3f) → CALIBRATION_APPLY",
+                workflow_id, bp_frac, gain_frac,
+            )
+            self.db.transition(workflow_id, Stage.CALIBRATION_APPLY)
+        else:
+            log.warning(
+                "Workflow %d: CALIBRATION_SOLVE thresholds not met (bp=%.3f gain=%.3f) → CALIBRATION_PREFLAG",
+                workflow_id, bp_frac, gain_frac,
+            )
+            self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
+
+    def _build_solve_script(self, workflow_id: int) -> str:
+        """Fill all CALIBRATION_SOLVE placeholders from Phase 1-3 tool outputs."""
+        outputs = self._load_all_tool_outputs(workflow_id)
+
+        flux_field_id = self._solve_flux_field_id(outputs)
+        phase_field_id = self._solve_phase_field_id(outputs, flux_field_id)
+
+        n_spw = (
+            outputs.get("ms_spectral_window_list", {})
+            .get("data", {}).get("n_spw", 16)
+        )
+        all_spw = f"0~{n_spw - 1}"
+
+        int_time_s = (
+            outputs.get("ms_correlator_config", {})
+            .get("data", {}).get("dump_time_s", {}).get("value", 2.0)
+        )
+
+        subs = {
+            "{WORKFLOW_ID}":    str(workflow_id),
+            "{FLUX_FIELD}":     str(flux_field_id),
+            "{BP_FIELD}":       str(flux_field_id),
+            "{DELAY_FIELD}":    str(flux_field_id),
+            "{PHASE_FIELD}":    str(phase_field_id),
+            "{PHASE_SCAN_IDS}": self._solve_cal_scan_ids(outputs, str(phase_field_id)),
+            "{REFANT}":         self._solve_best_refant(outputs),
+            "{ALL_SPW}":        all_spw,
+            "{FLUX_STANDARD}":  self._solve_flux_standard(outputs, flux_field_id),
+            "{MINBLPERANT}":    "4",
+            "{INT_TIME_S}":     f"{float(int_time_s):.2f}",
+        }
+        script = _TEMPLATE_SOLVE
+        for placeholder, value in subs.items():
+            script = script.replace(placeholder, value)
+        return script
+
+    def _solve_flux_field_id(self, outputs: dict) -> int:
+        """Return the field_id of the flux calibrator.
+
+        Prefers a field with calibrator_role containing 'flux'; falls back to
+        the first field with any calibrator_match.
+        """
+        fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
+        for f in fields:
+            if "flux" in f.get("calibrator_role", {}).get("value", []):
+                return f["field_id"]
+        for f in fields:
+            if f.get("calibrator_match", {}).get("value"):
+                return f["field_id"]
+        return 0
+
+    def _solve_phase_field_id(self, outputs: dict, flux_field_id: int) -> int:
+        """Return the field_id of the phase calibrator.
+
+        Uses a field explicitly marked 'phase'; falls back to the flux calibrator
+        field when no separate phase cal exists (common for short snapshots).
+        """
+        fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
+        for f in fields:
+            if "phase" in f.get("calibrator_role", {}).get("value", []):
+                return f["field_id"]
+        return flux_field_id
+
+    def _solve_cal_scan_ids(self, outputs: dict, field_id: str) -> str:
+        """Return comma-separated scan numbers on field_id from the scan list."""
+        scans = outputs.get("ms_scan_list", {}).get("data", {}).get("scans", [])
+        ids = [s["scan_number"] for s in scans if str(s.get("field_id")) == field_id]
+        return ",".join(ids) if ids else "1"
+
+    def _solve_best_refant(self, outputs: dict) -> str:
+        """Return the antenna with the lowest flag fraction (excluding 100% flagged)."""
+        per_ant = (
+            outputs.get("ms_antenna_flag_fraction", {})
+            .get("data", {}).get("per_antenna", [])
+        )
+        valid = [a for a in per_ant if a.get("flag_fraction", {}).get("value", 1.0) < 1.0]
+        if not valid:
+            return "ea01"
+        return min(valid, key=lambda a: a["flag_fraction"]["value"])["antenna_name"]
+
+    def _solve_flux_standard(self, outputs: dict, flux_field_id: int) -> str:
+        """Map the tool-output flux_standard to the CASA-accepted string."""
+        fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
+        for f in fields:
+            if f["field_id"] == flux_field_id:
+                raw = f.get("flux_standard", {}).get("value", "")
+                return self._FLUX_STANDARD_MAP.get(raw, raw)
+        return "Perley-Butler 2017"
+
+    # ── Deterministic CALIBRATION_APPLY ───────────────────────────────────
+
+    async def _handle_apply_stage(self, workflow_id: int) -> None:
+        """CALIBRATION_APPLY: fill template deterministically, run CASA, then call LLM
+        to interpret the metrics into human-facing checkpoint questions.
+        """
+        if self.stop_event.is_set():
+            self.db.transition(workflow_id, Stage.STOPPED)
+            return
+
+        script = self._build_apply_script(workflow_id)
+        await self._run_casa_job(workflow_id, Stage.CALIBRATION_APPLY.value, script)
+        if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
+            return
+
+        # Read metrics from both stages for the LLM summary
+        apply_metrics = self._read_job_metrics_for_stage(workflow_id, Stage.CALIBRATION_APPLY.value)
+        solve_metrics = self._read_job_metrics_for_stage(workflow_id, Stage.CALIBRATION_SOLVE.value)
+
+        user_content = (
+            "## CALIBRATION_SOLVE metrics\n```json\n"
+            + json.dumps(solve_metrics, indent=2)
+            + "\n```\n\n## CALIBRATION_APPLY metrics\n```json\n"
+            + json.dumps(apply_metrics, indent=2)
+            + "\n```"
+        )
+        system_prompt = load_system_prompt(self.skills_path, Stage.CALIBRATION_APPLY)
+        messages = [
+            {"role": "system", "content": system_prompt + "\n\n" + _JSON_INSTRUCTION_APPLY + "\n\n/no_think"},
+            {"role": "user",   "content": user_content},
+        ]
+
+        response = await self.llm.complete(messages)
+        raw = self._extract_content(response)
+        decision = self._parse_decision(raw)
+        model = response.get("model", "unknown")
+        self.db.save_llm_decision(
+            workflow_id, Stage.CALIBRATION_APPLY.value, json.dumps(decision), model
+        )
+
+        self.db.transition(workflow_id, Stage.CALIBRATION_CHECKPOINT)
+
+    def _build_apply_script(self, workflow_id: int) -> str:
+        """Fill all CALIBRATION_APPLY placeholders from Phase 1-3 tool outputs."""
+        outputs = self._load_all_tool_outputs(workflow_id)
+
+        # All calibrator field IDs — any field with a calibrator role or catalogue match
+        fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
+        cal_ids = [
+            str(f["field_id"]) for f in fields
+            if f.get("calibrator_role", {}).get("value")
+            or f.get("calibrator_match", {}).get("value")
+        ]
+        cal_fields = ",".join(cal_ids) if cal_ids else "0"
+
+        n_spw = (
+            outputs.get("ms_spectral_window_list", {})
+            .get("data", {}).get("n_spw", 16)
+        )
+        all_spw = f"0~{n_spw - 1}"
+
+        # Parallel hands only (e.g. XX,YY or RR,LL) for rflag on corrected data
+        all_prods = (
+            outputs.get("ms_correlator_config", {})
+            .get("data", {}).get("correlation_products", {}).get("value", ["XX", "YY"])
+        )
+        parallel = [p for p in all_prods if len(p) == 2 and p[0] == p[1]]
+        corrstring = ",".join(parallel) if parallel else "XX,YY"
+
+        subs = {
+            "{WORKFLOW_ID}": str(workflow_id),
+            "{CAL_FIELDS}": cal_fields,
+            "{ALL_SPW}":    all_spw,
+            "{CORRSTRING}": corrstring,
+        }
+        script = _TEMPLATE_APPLY
+        for placeholder, value in subs.items():
+            script = script.replace(placeholder, value)
+        return script
+
+    def _read_job_metrics_for_stage(self, workflow_id: int, stage_label: str) -> dict:
+        """Parse WILDCAT_METRICS from the most recent completed job for a given stage."""
+        row = self.db.conn.execute(
+            "SELECT stdout FROM jobs"
+            " WHERE workflow_id = ? AND stage = ? AND status = 'done'"
+            " ORDER BY completed_at DESC LIMIT 1",
+            (workflow_id, stage_label),
+        ).fetchone()
+        if not row or not row["stdout"]:
+            return {}
+        for line in row["stdout"].splitlines():
+            if line.startswith("WILDCAT_METRICS:"):
+                try:
+                    return json.loads(line[len("WILDCAT_METRICS:"):].strip())
+                except json.JSONDecodeError:
+                    pass
+        return {}
 
     # ── Checkpoint handler ─────────────────────────────────────────────────
 
@@ -701,19 +1277,45 @@ class Orchestrator:
     # ── CASA job helper ────────────────────────────────────────────────────
 
     async def _run_casa_job(self, workflow_id: int, stage_label: str, script_content: str) -> None:
-        """Write script to disk, submit to runner, await sentinel."""
+        """Write script to disk, submit to runner, await completion.
+
+        Transitions to ERROR if the job fails — callers should check for ERROR
+        state and return immediately after calling this method.
+        """
         script_dir = Path(self.runner.config.jobs_dir) / str(workflow_id)
         script_dir.mkdir(parents=True, exist_ok=True)
         script_path = script_dir / f"{stage_label}.py"
         script_path.write_text(script_content, encoding="utf-8")
 
         job_id = self.db.create_job(workflow_id, stage_label, str(script_path))
+        await self.runner.submit(job_id, str(script_path))
 
-        self.checkpoint_event.clear()
-        asyncio.create_task(self.runner.submit(job_id, str(script_path)))
-        await self.checkpoint_event.wait()
+        job = self.db.conn.execute(
+            "SELECT status, stderr FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if job and job["status"] == "failed":
+            log.error(
+                "Job %d (%s) failed — transitioning workflow %d to ERROR\n%s",
+                job_id, stage_label, workflow_id, job["stderr"] or "",
+            )
+            self.db.transition(workflow_id, Stage.ERROR)
 
     # ── Calibration prompt helpers ─────────────────────────────────────────
+
+    def _get_polcal_verdict(self, workflow_id: int) -> str | None:
+        """Read ms_pol_cal_feasibility verdict from stored Phase 3 tool outputs.
+
+        Returns the verdict string (e.g. 'FULL', 'NOT_FEASIBLE') or None if
+        the tool output is not available.
+        """
+        for row in self.db.get_tool_outputs(workflow_id, "phase3"):
+            if row["tool_name"] == "ms_pol_cal_feasibility":
+                try:
+                    output = json.loads(row["output_json"])
+                    return output.get("data", {}).get("verdict")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+        return None
 
     def _read_last_job_metrics(self, workflow_id: int) -> dict:
         """Parse WILDCAT_METRICS from the most recent completed job's stdout."""
@@ -732,11 +1334,19 @@ class Orchestrator:
                     pass
         return {}
 
-    def _load_all_tool_outputs(self, workflow_id: int) -> dict[str, dict]:
-        """Load all Phase 1-3 tool outputs keyed by tool name."""
+    def _load_all_tool_outputs(
+        self, workflow_id: int, tools: set[str] | None = None
+    ) -> dict[str, dict]:
+        """Load Phase 1-3 tool outputs keyed by tool name.
+
+        If tools is given, only those tool names are returned — keeps calibration
+        prompts focused on the placeholders each stage actually needs to fill.
+        """
         outputs: dict[str, dict] = {}
         for phase in ("phase1", "phase2", "phase3"):
             for row in self.db.get_tool_outputs(workflow_id, phase):
+                if tools is not None and row["tool_name"] not in tools:
+                    continue
                 try:
                     outputs[row["tool_name"]] = json.loads(row["output_json"])
                 except (json.JSONDecodeError, KeyError):
@@ -788,7 +1398,8 @@ class Orchestrator:
 
     def _parse_decision(self, raw: str) -> dict:
         """Extract and validate the LLM JSON decision."""
-        text = raw.strip()
+        # Strip Qwen3 thinking blocks (<think>...</think>) before parsing
+        text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         if text.startswith("```"):
             lines = text.splitlines()
             text = "\n".join(l for l in lines if not l.strip().startswith("```"))

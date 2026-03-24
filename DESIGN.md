@@ -1,9 +1,9 @@
 # wildcat — Design Document
 ## Agentic Radio Interferometry Reduction Pipeline
 
-**Status:** Working — Phase 1-2 end-to-end verified, calibration pipeline staged
-**Last revised:** 2026-03-17 (rev 5)
-**Scope:** Orchestration layer. Phases 1–3 inspection + human checkpoint routing.
+**Status:** End-to-end calibration run not yet completed — structural fixes complete, first full run pending
+**Last revised:** 2026-03-24 (rev 8)
+**Scope:** Full pipeline — inspection phases, deterministic config, calibration, human checkpoint.
 
 ---
 
@@ -13,11 +13,12 @@
 
 Radio interferometric reduction requires running CASA scripts that take minutes to
 hours. The workflow is not linear — after inspection a human expert must decide
-whether to proceed to imaging or return to flagging and calibration. This decision
-cannot be automated; it requires scientific judgment.
+whether the calibration is good enough to proceed to imaging, or whether to loop
+back. This judgment cannot be automated; it requires scientific assessment of
+calibration metrics.
 
-The goal is to automate everything *except* that judgment call, and to make the
-handoff to the human — and back — as frictionless as possible.
+The goal is to automate everything *except* that final judgment, and to make the
+handoff to the human as frictionless as possible.
 
 ### 1.2 Key Design Decisions
 
@@ -27,17 +28,26 @@ handoff to the human — and back — as frictionless as possible.
 - **ms-inspect over SSE.** ms-inspect serves MCP tools over SSE transport
   (`/sse`, `/messages/`) using `mcp.FastMCP.sse_app()` + uvicorn. The MCP
   Python client handles the protocol natively.
-- **Sentinel files, not polling.** CASARunner writes `<job_id>.done` or
-  `<job_id>.failed` on exit. watchdog fires an asyncio.Event to unblock
-  the orchestrator instantly.
+- **Direct asyncio subprocess await.** CASARunner.submit() is awaited directly
+  by the orchestrator. The asyncio event loop stays idle while CASA runs — no
+  sentinel files, no watchdog. Previous sentinel/watchdog approach was replaced
+  after diagnosing a failure mode where pre-existing `.done` files from prior
+  runs silently prevented inotify events from firing.
 - **Single container.** llama.cpp built from source with CUDA inside the image.
   ms-inspect volume-mounted and pip-installed at entrypoint. Model GGUF
   mounted at runtime.
 - **Explicit pipeline start gate.** The pipeline does not start automatically
   on container boot. wildcat waits for an explicit start signal before creating
   the workflow or starting the LLM. Priority: `--autostart` CLI flag >
-  `WILDCAT_AUTOSTART` env var > UI button at `/start`. This prevents accidental
-  GPU use and lets the operator verify configuration before committing.
+  `WILDCAT_AUTOSTART` env var > UI button at `/start`. `run.sh` passes
+  `WILDCAT_AUTOSTART=1` so automated runs are hands-off.
+- **Deterministic config over LLM judgment.** Data quality decisions with
+  measurable thresholds (polcal feasibility, antenna flagging) are made by
+  the orchestrator from tool outputs — not by the LLM and not by the human.
+  The LLM advances the pipeline; the orchestrator enforces constraints.
+- **CASA scripts run via python3.** `casatasks` is installed as a Python
+  package. Scripts are executed as `python3 script.py`, not via the `casa`
+  CLI. `config.toml [casa] executable = "python3"`, `args = []`.
 
 ---
 
@@ -64,37 +74,70 @@ handoff to the human — and back — as frictionless as possible.
 ### 2.1 Workflow State Machine
 
 ```
-IDLE → PHASE1_RUNNING → PHASE2_RUNNING → PHASE3_RUNNING → HUMAN_CHECKPOINT
-                                                               │
-                                              (human approves) │
-                                                               ▼
-                                              CALIBRATION_PREFLAG ◄──────────┐
-                                                       │ rflag calibrators    │
-                                                       │ (max 3 iterations)   │
-                                                       ▼                      │
-                                              CALIBRATION_SOLVE               │
-                                                       │ delay+BP+gain        │
-                                                       │ flag BP caltable     │
-                                                       │ emit WILDCAT_METRICS │
-                                                       ▼                      │
-                                              CALIBRATION_APPLY               │
-                                                       │ applycal             │
-                                                       │ rflag corrected      │
-                                                       │ flag target          │
-                                                       ▼                      │
-                                         CALIBRATION_CHECKPOINT               │
-                                              │            │                  │
-                                   (approve) │            │ (loop_back) ──────┘
-                                              ▼            ▼
-                                    IMAGING_PIPELINE    CALIBRATION_LOOP
-                                                             │
-                                                             └──► CALIBRATION_PREFLAG (restart)
+IDLE → PHASE1_RUNNING → PHASE2_RUNNING → PHASE3_RUNNING
+                                               │
+                              (always, unless fundamental data corruption)
+                                               │
+                                               ▼
+                                  CALIBRATION_PREFLAG ◄──────────────┐
+                                       │ rflag calibrators            │
+                                       │ (max 3 iterations)           │
+                                       ▼                              │
+                   (polcal=True,   CALIBRATION_SOLVE                  │
+                    verdict=FULL/   │ delay+BP+gain                   │
+                    DEGRADED)       │ flag BP caltable                │
+                        │           │ emit WILDCAT_METRICS            │
+                        ▼           ▼                                 │
+                  POLCAL_SOLVE  CALIBRATION_APPLY                     │
+                   delay+BP+gain    │ applycal                        │
+                   setjy(polcal)    │ rflag corrected + target        │
+                   Kcross+Df+Xf ───┘ emit WILDCAT_METRICS            │
+                   WILDCAT_METRICS  │                                 │
+                                    ▼                                 │
+                         CALIBRATION_CHECKPOINT                       │
+                              │            │                          │
+                   (approve)  │            │ (loop_back) ─────────────┘
+                              ▼            ▼
+                    IMAGING_PIPELINE   CALIBRATION_LOOP
 ```
 
-The LLM is the orchestrator at every calibration stage — it reads
-`WILDCAT_METRICS` from CASA stdout and decides whether to loop or advance.
-The orchestrator enforces a 3-iteration cap on `CALIBRATION_PREFLAG` and
-escalates to `CALIBRATION_CHECKPOINT` if data remains heavily flagged.
+**LLM role in inspection phases (1–3):**
+- Each phase calls its MCP tool group, passes outputs to LLM, reads JSON decision.
+- LLM may only advance to the next phase or return `ERROR` for fundamental data
+  corruption (all calibrators missing/corrupt, no usable data).
+- `HUMAN_CHECKPOINT` is blocked by the orchestrator in all inspection phases —
+  if the LLM returns it, the orchestrator overrides to the next phase and logs
+  a warning. Phase 3 does not include `casa_script` in its JSON schema.
+- After Phase 3, the orchestrator applies **deterministic config rules** (see §2.3)
+  before transitioning to `CALIBRATION_PREFLAG`.
+
+**Calibration phase LLM role (per stage):**
+
+| Stage | Script | Next-stage decision | LLM role |
+|-------|--------|---------------------|----------|
+| CALIBRATION_PREFLAG | LLM fills template | LLM: loop or proceed | Full LLM |
+| CALIBRATION_SOLVE | Orchestrator fills all placeholders | Rule: bp<0.20 AND gain<0.15 → APPLY, else → PREFLAG | None |
+| CALIBRATION_APPLY | Orchestrator fills all placeholders | Fixed: → CALIBRATION_CHECKPOINT | Metrics summary + checkpoint questions only |
+| POLCAL_SOLVE | LLM fills template | Fixed: → CALIBRATION_APPLY | Full LLM |
+
+Orchestrator enforces: 3-iteration cap on CALIBRATION_PREFLAG, flag-fraction
+cap (if overall > 0.50, force-advance rather than flagging away more data), job
+failure → ERROR (no LLM retry on failed CASA).
+
+**Polcal routing (orchestrator, not LLM):**
+- `ms_pol_cal_feasibility` verdict read from Phase 3 tool outputs (already in DB).
+- After CALIBRATION_PREFLAG, if `polcal=True` AND verdict ∈ {FULL, DEGRADED}:
+  orchestrator redirects `CALIBRATION_SOLVE → POLCAL_SOLVE`.
+- If verdict is NOT_FEASIBLE or LEAKAGE_ONLY: uses CALIBRATION_SOLVE silently.
+- CALIBRATION_APPLY auto-detects polcal tables via `os.path.exists`; sets
+  `parang=True` only when they are present.
+
+**Human checkpoint (CALIBRATION_CHECKPOINT only):**
+- The one remaining human decision: are calibration metrics good enough to image?
+- The LLM generates a single `calibration_done` question with real metrics
+  (`bp_flagged_frac`, `gain_flagged_frac`, `post_cal_flag_frac`, `n_antennas_lost`).
+- Options: `proceed` → IMAGING_PIPELINE, `loop_back` → CALIBRATION_LOOP,
+  `exit` → STOPPED.
 
 ### 2.2 MCP Tool Groups
 
@@ -106,6 +149,30 @@ escalates to `CALIBRATION_CHECKPOINT` if data remains heavily flagged.
 
 ms-inspect exposes 20 tools total (verified against 3C129_1.ms).
 
+### 2.3 Deterministic Config Rules
+
+Applied by the orchestrator after Phase 3 tool calls, before any LLM decision:
+
+| Tool output | Rule | Config effect |
+|------------|------|--------------|
+| `ms_pol_cal_feasibility.data.verdict` ∈ {NOT_FEASIBLE, DEGRADED} | polcal not viable | `polcal = False` |
+| Any `ms_antenna_flag_fraction.data.per_antenna[].flag_fraction >= 1.0` | antenna fully dead | `aggressive_flagging = True` |
+
+These override any LLM `config_updates`. Logged as warnings. The human is
+notified via the pipeline monitor but not asked to confirm — the data speaks.
+
+### 2.4 WILDCAT_METRICS Protocol
+
+CASA scripts emit one line to stdout at the end:
+
+```
+WILDCAT_METRICS: {"stage": "CALIBRATION_PREFLAG", "overall_flag_frac": 0.12, ...}
+```
+
+The orchestrator parses this in `_read_last_job_metrics()` and passes it to the
+next LLM call as context. If a job fails (no metrics line), `_run_casa_job`
+transitions to ERROR immediately — no LLM call on failed jobs.
+
 ---
 
 ## 3. Container
@@ -116,26 +183,42 @@ ms-inspect exposes 20 tools total (verified against 3C129_1.ms).
 |--------|---------|
 | `build.sh` | Builds the container image — run once or when `Containerfile` changes |
 | `fetch-model.sh` | Downloads the default GGUF (`unsloth/Qwen3.5-4B-GGUF`) from HuggingFace; uses `huggingface-cli` if available, falls back to `curl`; respects `HF_TOKEN`; outputs the local path to stdout |
-| `run.sh` | Starts the container — requires image and `MODEL_PATH` to exist; fails fast if either is missing |
+| `run.sh` | Starts the container with `WILDCAT_AUTOSTART=1` — fully hands-off; requires image and `MODEL_PATH` to exist |
+| `clean.sh` | Kills the running container and removes `wildcat.db` — idempotent; use before a fresh run |
 
-Override the model with `HF_REPO` / `HF_FILE` env vars. Override host ports with
-`PORT_MS_INSPECT` (default 8100), `PORT_LLAMA` (default 8180), `PORT_UI` (default 8181).
+**Typical workflow:**
+```bash
+./build.sh          # once, or on Containerfile changes
+export MODEL_PATH=$(./fetch-model.sh)   # once
+./run.sh            # start — hands-off, polls until CALIBRATION_CHECKPOINT
+./clean.sh          # reset between runs
+```
+
+Override host ports with `PORT_MS_INSPECT` (default 8100), `PORT_LLAMA` (default
+8180), `PORT_UI` (default 8181).
+
+### 3.2 Container Image
 
 **Base image:** `docker.io/nvidia/cuda:12.6.3-devel-ubuntu24.04`
-Note: CUDA 12.9.1 is incompatible with current llama.cpp (CCCL 2.9 macro
-breakage). 12.6.3 produces a binary that runs correctly on the host's 12.9
-driver stack.
 
-**GPU injection (WSL2):** CDI spec generated via `nvidia-ctk cdi generate`
-and placed in `/etc/cdi/nvidia.yaml`. Container launched with
-`--device nvidia.com/gpu=all`.
+Note: CUDA 12.9 host driver is compatible at runtime; 12.6.3 is the build base
+because CUDA 12.9 CCCL macros break llama.cpp compilation.
+
+**GPU injection (WSL2):** CDI spec generated via `nvidia-ctk cdi generate` and
+placed in `/etc/cdi/nvidia.yaml`. Container launched with `--device nvidia.com/gpu=all`.
 
 **llama.cpp build flags:**
 ```
 -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_CUDA_ARCHITECTURES=86
 ```
-`BUILD_SHARED_LIBS=OFF` avoids the `libcuda.so.1` link-time issue — the
-static binary resolves it at runtime from the CDI-injected driver.
+`BUILD_SHARED_LIBS=OFF` avoids `libcuda.so.1` link-time issues — the static binary
+resolves it at runtime from the CDI-injected driver stack.
+
+**entrypoint.sh:** Runs `pip install --upgrade -e /opt/ms-inspect[casa]` at every
+container start so the live source is always used. Side effect: this can upgrade
+Python dependencies (e.g. Starlette) to versions with breaking API changes. Known
+issue: Starlette 1.0.0 changed `TemplateResponse(name, context)` to
+`TemplateResponse(request, name, context)` — all UI routes use the new signature.
 
 ---
 
@@ -145,158 +228,135 @@ static binary resolves it at runtime from the CDI-injected driver.
 
 | Route | Purpose |
 |-------|---------|
-| `/start` | Pre-start gate — shows MS path, predicted workflow ID, Start Pipeline button |
-| `/pipeline/{id}` | Live pipeline transparency monitor — tool outputs, LLM decisions, CASA artifacts |
-| `/checkpoint/{id}` | Human checkpoint — structured questions, route decision |
+| `/start` | Pre-start gate — shows MS path, predicted workflow ID, Start Pipeline button. Bypassed when `WILDCAT_AUTOSTART=1`. |
+| `/pipeline/{id}` | Live pipeline transparency monitor — tool outputs, LLM decisions, CASA artifacts. HTMX polling (1s). |
+| `/checkpoint/{id}` | Human checkpoint — structured calibration metrics question, route decision. Only reached at CALIBRATION_CHECKPOINT. |
 | `/logs` | Raw log stream (SSE tail of `/var/log/wildcat.log`) |
 
 ### 4.2 Pipeline Monitor (`/pipeline/{id}`)
 
-HTMX polling (1s) of `/pipeline/{id}/fragment`. Renders:
+HTMX polling (1s) of `/pipeline/{id}/fragment`. All `<details>` elements render
+open by default (HTMX replaces the DOM on each poll; `open` attribute ensures
+content is always visible). Renders:
+
 - **MCP Tool Calls** — per-phase cards with structured field extraction from the
   `{value, flag}` ms-inspect envelope. Per-tool renderers: field chips
   (ms_field_list), scan table (ms_scan_list), SPW table (ms_spectral_window_list),
   intent bar chart (ms_scan_intent_summary), generic KV table fallback.
-- **LLM Decisions** — summary (primary), reasoning trace (collapsible), next_stage
-  badge, CASA script (collapsible).
-- **CASA Jobs & Artifacts** — job status badges, plot thumbnails, stdout/stderr.
-- **Stop pipeline** button — cooperative cancellation via `stop_event` asyncio.Event;
-  orchestrator checks at phase boundaries (before tools, before LLM, before CASA).
-  Transitions to `STOPPED` stage on next safe boundary.
+- **LLM Decisions** — summary (primary), reasoning trace, next_stage badge, CASA
+  script (when present).
+- **CASA Jobs & Artifacts** — job status badges, stdout/stderr, plot thumbnails.
+- **Stop pipeline** button — cooperative cancellation via `stop_event`; orchestrator
+  checks at phase boundaries. Transitions to `STOPPED` at next safe boundary.
 
-### 4.3 Human Checkpoint — Structured Questions (rev 4)
+### 4.3 Human Checkpoint (CALIBRATION_CHECKPOINT only)
 
-**Problem:** The current checkpoint presents two hard-coded buttons (imaging /
-calibration) with no scientific context. This is too blunt for domain experts.
+The one human decision point: proceed to imaging or loop back for another
+calibration pass. The LLM emits a single `calibration_done` question with real
+metric values (`bp_flagged_frac`, `gain_flagged_frac`, `post_cal_flag_frac`,
+`n_antennas_lost`). Options: `proceed`, `loop_back`, `exit`.
 
-**Design:**
+Polcal and flagging decisions are **not** human questions — they are derived
+deterministically from tool outputs (see §2.3). The checkpoint_panel uses an
+HTMX outerHTML swap trick to lock the form once questions arrive, preventing
+the polling from resetting the form state.
 
-The LLM emits a `checkpoint_questions` array when `next_stage == HUMAN_CHECKPOINT`,
-as part of its existing Phase N decision JSON. No second LLM call (empirical
-first — may add dedicated checkpoint reasoning call later if same-call quality
-is poor).
+---
 
-```json
-"checkpoint_questions": [
-  {
-    "id": "polcal",
-    "finding": "PA coverage is 45° — below the 90° threshold for reliable polarization calibration.",
-    "severity": "warning",
-    "question": "Proceed without polarization calibration?",
-    "options": ["proceed", "loop_back", "exit"]
-  },
-  {
-    "id": "aggressive_flagging",
-    "finding": "3 scans show elevated RFI in spw 4-6.",
-    "severity": "info",
-    "question": "Apply aggressive flagging before calibration?",
-    "options": ["yes", "no"]
-  }
-]
-```
+## 5. LLM Contract
 
-Options always include `exit` as a valid escape hatch.
-
-**Route resolution (orchestrator-side, deterministic):**
-
-| answers contain | route |
-|----------------|-------|
-| any `exit` | → `STOPPED` |
-| any `loop_back` | → `CALIBRATION_LOOP` |
-| all `proceed` / `yes` / `no` | → `IMAGING_PIPELINE` |
-
-Priority: exit > loop_back > proceed.
-
-**Config mapping (fixed rule table in orchestrator, not LLM-generated):**
-
-The tiny model (Qwen3.5-4B) is not asked to emit config key/value mappings —
-that is fragile schema generation. Instead a static table in the orchestrator
-maps `(question_id, answer) → (config_key, value)`:
-
-```python
-_QUESTION_CONFIG_MAP = {
-    "polcal":              {"proceed": ("polcal", False),           "loop_back": None, "exit": None},
-    "aggressive_flagging": {"yes":     ("aggressive_flagging", True), "no": ("aggressive_flagging", False)},
-}
-```
-
-**Workflow config state:**
-
-A `workflow_config` JSON column on the `workflow` table carries human decisions
-forward. Defaults are source-agnostic pipeline defaults:
+### 5.1 Inspection Phases (1–2)
 
 ```json
 {
-  "polcal": true,
-  "aggressive_flagging": false
+  "next_stage": "<PHASE2_RUNNING | PHASE3_RUNNING | ERROR>",
+  "casa_script": "<python string or null>",
+  "summary": "<2-5 sentences>",
+  "reasoning": "<brief trace>"
 }
 ```
 
-This blob is injected into every subsequent LLM prompt (Phase 2+) so the model
-knows what the human has decided and adjusts tool selection and recommendations
-accordingly.
+### 5.2 Inspection Phase 3
 
-**DB changes:**
-- `workflow.workflow_config TEXT` — JSON blob, written at workflow creation,
-  updated after each checkpoint resolution.
-- `checkpoints.question_answers TEXT` — JSON blob recording human answer per
-  question_id for audit trail.
+```json
+{
+  "next_stage": "<CALIBRATION_PREFLAG | ERROR>",
+  "summary": "<2-5 sentences>",
+  "reasoning": "<brief trace>"
+}
+```
 
-**What changes per file:**
+No `casa_script` (Phase 3 is read-only inspection). No `config_updates` or
+`checkpoint_questions` (config is set deterministically). `HUMAN_CHECKPOINT` is
+not a valid option — the orchestrator overrides it if returned.
 
-| File | Change |
-|------|--------|
-| `state.py` | `workflow_config` column; `get/set_workflow_config()` methods |
-| `orchestrator.py` | Inject config into LLM prompts; parse `checkpoint_questions`; apply `_QUESTION_CONFIG_MAP`; resolve route from answers |
-| `_DECISION_SCHEMA_KEYS` | `checkpoint_questions` added as optional key |
-| `_JSON_INSTRUCTION` | Document new schema to LLM |
-| `ui/app.py` | `POST /checkpoint/{id}/decide` accepts per-question answers, resolves route, writes config |
-| `templates/checkpoint.html` | Question cards with option buttons; plot display |
+### 5.3 Calibration Stages
 
-### 4.4 Plots in checkpoint UI
+Only CALIBRATION_PREFLAG and POLCAL_SOLVE involve a full LLM call to fill the script template. CALIBRATION_SOLVE and CALIBRATION_APPLY scripts are filled deterministically by the orchestrator.
 
-The checkpoint page renders plot thumbnails inline (from `jobs.plots`) with
-LLM-provided captions where available. The pipeline monitor also shows them
-under CASA Jobs. The LLM may reference specific plot filenames in its
-`checkpoint_questions` findings to direct the human's attention.
+**CALIBRATION_PREFLAG** (LLM fills script + decides next stage):
+```json
+{
+  "next_stage": "<CALIBRATION_PREFLAG | CALIBRATION_SOLVE>",
+  "casa_script": "<completed script>",
+  "summary": "<flag fractions found and decision>",
+  "reasoning": "<brief trace>"
+}
+```
+
+**CALIBRATION_APPLY** (LLM interprets results only — no script, no routing):
+```json
+{
+  "summary": "<2-5 sentences on calibration quality>",
+  "checkpoint_questions": [
+    {
+      "id": "calibration_done",
+      "finding": "<bp_flagged_frac=X, gain_flagged_frac=Y, post_cal_flag_frac=Z, n_antennas_lost=N>",
+      "severity": "<info|warning|critical>",
+      "question": "Calibration complete. Proceed to imaging or loop back?",
+      "options": ["proceed", "loop_back", "exit"]
+    }
+  ]
+}
+```
+
+### 5.4 Error Handling
+
+- Bad JSON from LLM → `ValueError` → caught by `run()` try/except → ERROR state,
+  clean exit (no supervisord restart loop).
+- Failed CASA job → sentinel `.failed` detected → `_run_casa_job` transitions to
+  ERROR → caller returns immediately.
+- Unknown `next_stage` value → transition to ERROR.
+- Illegal `next_stage` for calibration stage (not in whitelist) → transition to ERROR.
 
 ---
 
-## 5. Current Status (2026-03-17)
+## 6. Current Status (2026-03-24)
 
 ### Working
-- Container builds successfully (llama.cpp + CUDA 12.6, sm_86)
-- ms-inspect starts via supervisord, serves all 20 tools over SSE
-- Phase 1 and 2 tools verified against 3C129_1.ms
-- LLM (Qwen3.5-4B Q4_K_XL, RTX 3080 Laptop) produces structured JSON decisions
-- Workflow transitions through inspection phases to HUMAN_CHECKPOINT
-- Structured checkpoint UI — per-question cards with data-driven findings,
-  polcal and aggressive_flagging decisions captured in workflow_config
-- Pipeline monitor at `/pipeline/{id}` — one page: tool cards, LLM decisions,
-  CASA jobs, and checkpoint form in a single HTMX-polled view
-- Checkpoint panel uses outerHTML swap trick to lock the form once the
-  questions arrive (polling stops, form is stable and clickable)
-- Calibration pipeline staged: CALIBRATION_PREFLAG → CALIBRATION_SOLVE →
-  CALIBRATION_APPLY → CALIBRATION_CHECKPOINT — LLM routes autonomously via
-  WILDCAT_METRICS; 3-iteration preflag cap enforced in orchestrator
-- CASA script templates with deterministic sections (solint from scan
-  durations, flagcal on BP caltable, rflag, metrics) and LLM-filled
-  placeholders (field names, refant, flux standard)
-- Container scripts split: `build.sh` (image), `fetch-model.sh` (GGUF download),
-  `run.sh` (start only — preflight asserts both exist)
-- Pipeline start gate: `/start` UI screen with MS path confirmation;
-  `WILDCAT_AUTOSTART` / `--autostart` for automated runs
-- Host ports configurable via `PORT_MS_INSPECT` / `PORT_LLAMA` / `PORT_UI`
+- Container builds (llama.cpp + CUDA 12.6, sm_86)
+- ms-inspect starts via supervisord, 20 tools over SSE
+- Phases 1–3 complete against 3C129_1.ms
+- Deterministic config: polcal=False (poor PA), aggressive_flagging=True (ea19 dead)
+- Inspection phases never block at HUMAN_CHECKPOINT (guard + override)
+- CASA scripts execute via python3 + casatasks (no standalone `casa` binary needed)
+- Failed CASA job → ERROR state, no loop
+- LLM parse errors → ERROR state, no supervisord restart loop
+- All UI routes work with Starlette 1.0.0
+- Pipeline monitor cells expand by default
+- CALIBRATION_PREFLAG CASA script runs successfully (rflag + flag fraction metrics)
+- CALIBRATION_SOLVE: all placeholders filled deterministically (field ID, refant, flux standard, SPWs, scans, int time)
+- CALIBRATION_APPLY: CASA script filled deterministically; LLM generates human-facing summary only
+- Orchestrator no longer uses sentinel files or watchdog — direct asyncio subprocess await
 
 ### Open / Next
-- End-to-end calibration test (CASA not yet in container)
+- First successful CALIBRATION_SOLVE → CALIBRATION_APPLY → CALIBRATION_CHECKPOINT run (untested)
 - CALIBRATION_CHECKPOINT UI validation with real bp/gain metrics
 - Imaging script generation post-calibration
-- Phase 3 tool calls untested end-to-end
 
 ---
 
-## 6. Known Issues / Resolved
+## 7. Known Issues / Resolved
 
 | Issue | Resolution |
 |-------|-----------|
@@ -306,3 +366,13 @@ under CASA Jobs. The LLM may reference specific plot filenames in its
 | `FastMCP.run()` host kwarg missing | Switch to `sse_app()` + uvicorn |
 | Second LLM call OOM in `_handle_checkpoint` | Re-use summary from llm_decisions table |
 | ms-inspect not on PyPI | pip install from mounted volume in entrypoint.sh |
+| LLM escalating inspection phases to HUMAN_CHECKPOINT | Guard + override in orchestrator; not a valid next_stage from Phase 3 |
+| Starlette 1.0.0 breaking TemplateResponse API | All calls updated to (request, name, context) |
+| `casa` binary not in container | Execute scripts via `python3`; casatasks is the Python package |
+| Failed CASA job not detected — orchestrator loops | `_run_casa_job` checks job status post-sentinel; transitions to ERROR |
+| LLM parse error crashes process, supervisord restarts as new workflow | try/except in `run()` loop; transitions to ERROR, exits cleanly |
+| Pipeline stuck waiting for `/start` in run.sh | `WILDCAT_AUTOSTART=1` added to `podman run` in run.sh |
+| `casa_script` required in `_DECISION_SCHEMA_KEYS` | Made optional; Phase 3 schema omits it entirely |
+| Orchestrator permanently blocked after CALIBRATION_PREFLAG completes | Sentinel file `1.done` pre-existed from prior container run; `touch()` on existing file produces `FileModifiedEvent`, not `FileCreatedEvent`; watchdog never fired. Fixed: removed sentinel/watchdog, replaced with direct `await runner.submit()`. |
+| LLM hallucinating wrong CALIBRATION_SOLVE placeholders (`flux_standard` hyphen format, `corrstring` including cross-hands) | CALIBRATION_SOLVE made fully deterministic — orchestrator fills all placeholders from tool outputs. No LLM involvement in script generation. |
+| CALIBRATION_APPLY script still LLM-generated | Made deterministic — orchestrator fills CAL_FIELDS, ALL_SPW, CORRSTRING. LLM retained only for post-run checkpoint question generation. |

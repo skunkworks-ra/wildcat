@@ -21,7 +21,7 @@ import uvicorn
 from wildcat.config import load_config
 from wildcat.llm import LLMBackend
 from wildcat.orchestrator import Orchestrator
-from wildcat.runner import CASARunner, SentinelWatcher
+from wildcat.runner import CASARunner
 from wildcat.state import StateDB
 from wildcat.tools import MSInspectClient
 from wildcat.ui.app import build_ui_app
@@ -130,8 +130,6 @@ async def main_async() -> None:
 
             # ── Runner + watcher ─────────────────────────────────────────
             runner = CASARunner(cfg.casa, db)
-            watcher = SentinelWatcher(Path(cfg.casa.jobs_dir), checkpoint_event)
-            watcher.start()
 
             # ── Orchestrator ──────────────────────────────────────────────
             orchestrator = Orchestrator(
@@ -147,7 +145,6 @@ async def main_async() -> None:
             try:
                 await orchestrator.run(workflow_id)
             finally:
-                watcher.stop()
                 ui_server.should_exit = True
                 await ui_task
                 await llm.stop()
