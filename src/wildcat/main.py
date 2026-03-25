@@ -140,6 +140,8 @@ async def main_async() -> None:
                 runner=runner,
                 checkpoint_event=checkpoint_event,
                 stop_event=stop_event,
+                max_user_tokens=cfg.llm.max_user_tokens,
+                max_retries=cfg.llm.max_retries,
             )
 
             try:
