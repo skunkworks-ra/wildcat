@@ -144,7 +144,7 @@ _QUESTION_CONFIG_MAP: dict[str, dict[str, tuple[str, object] | None]] = {
 # Sections marked [DETERMINISTIC] must be copied verbatim.
 
 _TEMPLATE_PREFLAG = """\
-# wildcat CALIBRATION_PREFLAG — split calibrators, rflag, report flag fractions
+# wildcat CALIBRATION_PREFLAG — split calibrators, tfcrop, report flag fractions
 # LLM: fill all {PLACEHOLDER} values from Phase 1-3 tool outputs
 
 import json, os
@@ -162,24 +162,26 @@ vis = workdir + '/calibrators.ms'
 if not os.path.exists(vis):
     split(vis=original_ms, outputvis=vis, field=cal_fields, datacolumn='data', keepflags=True)
 
-# [DETERMINISTIC] rflag on calibrators
+# [DETERMINISTIC] tfcrop + extend in a single list-mode pass (one MS read)
+# tfcrop is appropriate here — raw data lacks Gaussian statistics needed by rflag
+flag_cmds = [
+    "mode='tfcrop' field='" + cal_fields + "' spw='" + all_spw + "' correlation='ABS_" + corrstring + "' ntime='scan' combinescans=False datacolumn='data' timecutoff=4.0 freqcutoff=4.0 timefit='line' freqfit='poly' maxnpieces=7 flagdimension='freqtime' extendflags=False",
+    "mode='extend' field='" + cal_fields + "' spw='" + all_spw + "' growtime=50.0 growfreq=90.0",
+]
 flagdata(
-    vis=vis, mode='rflag',
-    field=cal_fields, spw=all_spw,
-    correlation='ABS_' + corrstring,
-    ntime='scan', combinescans=False,
-    datacolumn='data',
-    winsize=3, timedevscale=4.0, freqdevscale=4.0,
-    extendflags=False, action='apply', flagbackup=False,
-)
-
-# [DETERMINISTIC] Extend flags to full polarisation products
-flagdata(
-    vis=vis, mode='extend',
-    field=cal_fields, spw=all_spw,
-    growtime=50.0, growfreq=90.0,
+    vis=vis, mode='list',
+    inpfile=flag_cmds,
     action='apply', flagbackup=False,
 )
+
+# [DETERMINISTIC] Discard SPWs above threshold in one pass
+_spw_summary = flagdata(vis=vis, mode='summary', spwchan=True, action='calculate', savepars=False)
+_bad_spws = ','.join(
+    spw for spw, info in _spw_summary.get('spw', {}).items()
+    if info['flagged'] / max(info['total'], 1) > {SPW_DISCARD_THRESHOLD}
+)
+if _bad_spws:
+    flagdata(vis=vis, mode='manual', spw=_bad_spws, action='apply', flagbackup=False)
 
 # [DETERMINISTIC] Collect and report flag fractions
 summary = flagdata(
@@ -372,15 +374,15 @@ applycal(
     flagbackup=True,
 )
 
-# [DETERMINISTIC] rflag on CORRECTED column for calibrators
+# [DETERMINISTIC] rflag + extend on CORRECTED column in a single list-mode pass
+flag_cmds = [
+    "mode='rflag' field='" + cal_field + "' spw='" + all_spw + "' correlation='ABS_" + corrstring + "' ntime='scan' combinescans=False datacolumn='corrected' winsize=3 timedevscale=4.0 freqdevscale=4.0 extendflags=False",
+    "mode='extend' field='" + cal_field + "' spw='" + all_spw + "' growtime=50.0 growfreq=90.0",
+]
 flagdata(
-    vis=vis, mode='rflag',
-    field=cal_field, spw=all_spw,
-    correlation='ABS_' + corrstring,
-    ntime='scan', combinescans=False,
-    datacolumn='corrected',
-    winsize=3, timedevscale=4.0, freqdevscale=4.0,
-    extendflags=False, action='apply', flagbackup=False,
+    vis=vis, mode='list',
+    inpfile=flag_cmds,
+    action='apply', flagbackup=False,
 )
 
 # [DETERMINISTIC] Final flag summary on corrected data
@@ -623,6 +625,21 @@ _PREFLAG_MAX_ITERATIONS = 3
 # If overall flag fraction exceeds this after a preflag pass, stop looping and proceed to solve.
 # At P-band, >50% flagging is endemic RFI — more flagging destroys more data than it saves.
 _PREFLAG_FLAG_CAP = 0.50
+
+# SPWs with flag fraction above this after tfcrop are discarded entirely before solve.
+_SPW_DISCARD_THRESHOLD = 0.80
+
+# Per-band thresholds for CALIBRATION_SOLVE → CALIBRATION_APPLY routing.
+# Keyed by band letter derived from band_centre_ghz in ms_pol_cal_feasibility.
+# (bp_flagged_frac_max, gain_flagged_frac_max)
+_SOLVE_THRESHOLDS_BY_BAND: dict[str, tuple[float, float]] = {
+    "P":       (0.60, 0.60),  # 230–470 MHz — endemic RFI environment
+    "L":       (0.60, 0.60),  # 1–2 GHz
+    "S":       (0.40, 0.40),  # 2–4 GHz
+    "C":       (0.20, 0.15),  # 4–8 GHz
+    "X":       (0.20, 0.15),  # 8–12 GHz
+    "default": (0.40, 0.40),
+}
 
 # Tool outputs needed per calibration stage — only relevant tools are sent to the LLM.
 # Decision context (loop/proceed) comes from workflow_config and prev_metrics, not tool dumps.
@@ -1011,6 +1028,9 @@ class Orchestrator:
         template = _TEMPLATES_BY_STAGE.get(stage)
         if template:
             tmpl = template.replace("{WORKFLOW_ID}", str(workflow_id))
+            # Pre-fill deterministic placeholders so the LLM can't misidentify fields/SPWs
+            if stage == Stage.CALIBRATION_PREFLAG:
+                tmpl = self._prefill_preflag_template(workflow_id, tmpl)
             base_lines.append("\n## Script template")
             base_lines.append("Complete the script by replacing ALL {PLACEHOLDER} values.")
             base_lines.append("Do NOT modify sections marked [DETERMINISTIC].")
@@ -1211,7 +1231,7 @@ class Orchestrator:
         """CALIBRATION_SOLVE: fill template deterministically, run CASA, apply threshold rule.
 
         No LLM call. All placeholders are derived from Phase 1-3 tool outputs.
-        Threshold rule: bp_flagged_frac < 0.20 AND gain_flagged_frac < 0.15 → CALIBRATION_APPLY,
+        Threshold rule: bp/gain_flagged_frac < per-band thresholds → CALIBRATION_APPLY,
         otherwise → CALIBRATION_PREFLAG for another flagging pass.
         """
         if self.stop_event.is_set():
@@ -1227,7 +1247,12 @@ class Orchestrator:
         bp_frac   = float(metrics.get("bp_flagged_frac",   1.0))
         gain_frac = float(metrics.get("gain_flagged_frac", 1.0))
 
-        if bp_frac < 0.20 and gain_frac < 0.15:
+        band = self._get_band(workflow_id)
+        bp_max, gain_max = _SOLVE_THRESHOLDS_BY_BAND.get(band, _SOLVE_THRESHOLDS_BY_BAND["default"])
+        log.info("Workflow %d: band=%s thresholds bp<%.2f gain<%.2f (actual bp=%.3f gain=%.3f)",
+                 workflow_id, band, bp_max, gain_max, bp_frac, gain_frac)
+
+        if bp_frac < bp_max and gain_frac < gain_max:
             log.info(
                 "Workflow %d: CALIBRATION_SOLVE passed (bp=%.3f gain=%.3f) → CALIBRATION_APPLY",
                 workflow_id, bp_frac, gain_frac,
@@ -1249,6 +1274,42 @@ class Orchestrator:
                     workflow_id, bp_frac, gain_frac,
                 )
                 self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
+
+    def _prefill_preflag_template(self, workflow_id: int, tmpl: str) -> str:
+        """Fill deterministic PREFLAG placeholders from stored tool outputs.
+
+        Fills VIS, CAL_FIELDS, ALL_SPW, CORRSTRING — the same derivation used
+        by _build_solve_script — so the LLM cannot misidentify target fields.
+        """
+        outputs = self._load_all_tool_outputs(workflow_id)
+
+        fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
+        cal_ids = [
+            str(f["field_id"]) for f in fields
+            if f.get("calibrator_role", {}).get("value")
+            or f.get("calibrator_match", {}).get("value")
+        ]
+        cal_fields = ",".join(cal_ids) if cal_ids else "0"
+
+        n_spw = outputs.get("ms_spectral_window_list", {}).get("data", {}).get("n_spw", 16)
+        all_spw = f"0~{n_spw - 1}"
+
+        corr_products = (
+            outputs.get("ms_correlator_config", {})
+            .get("data", {}).get("corr_products", [])
+        )
+        parallel = [c for c in corr_products if c in ("XX", "YY", "RR", "LL")]
+        corrstring = ",".join(parallel) if parallel else "XX,YY"
+
+        wf = self.db.get_workflow(workflow_id)
+        return (
+            tmpl
+            .replace("{VIS}", wf["ms_path"])
+            .replace("{CAL_FIELDS}", cal_fields)
+            .replace("{ALL_SPW}", all_spw)
+            .replace("{CORRSTRING}", corrstring)
+            .replace("{SPW_DISCARD_THRESHOLD}", str(_SPW_DISCARD_THRESHOLD))
+        )
 
     def _build_solve_script(self, workflow_id: int) -> str:
         """Fill all CALIBRATION_SOLVE placeholders from Phase 1-3 tool outputs."""
@@ -1489,6 +1550,30 @@ class Orchestrator:
             self.db.transition(workflow_id, Stage.ERROR)
 
     # ── Calibration prompt helpers ─────────────────────────────────────────
+
+    def _get_band(self, workflow_id: int) -> str:
+        """Derive band letter from band_centre_ghz in ms_pol_cal_feasibility.
+
+        Returns 'P', 'L', 'S', 'C', 'X', or 'default' if not available.
+        """
+        for row in self.db.get_tool_outputs(workflow_id, "phase3"):
+            if row["tool_name"] == "ms_pol_cal_feasibility":
+                try:
+                    output = json.loads(row["output_json"])
+                    ghz = float(output.get("data", {}).get("band_centre_ghz", 0))
+                    if ghz < 1.0:
+                        return "P"
+                    elif ghz < 2.0:
+                        return "L"
+                    elif ghz < 4.0:
+                        return "S"
+                    elif ghz < 8.0:
+                        return "C"
+                    else:
+                        return "X"
+                except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+                    pass
+        return "default"
 
     def _get_polcal_verdict(self, workflow_id: int) -> str | None:
         """Read ms_pol_cal_feasibility verdict from stored Phase 3 tool outputs.

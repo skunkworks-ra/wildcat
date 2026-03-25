@@ -104,70 +104,106 @@ class LLMBackend:
     ) -> dict[str, Any]:
         """Multi-turn tool-use loop.
 
-        Sends messages with tool definitions. If the LLM responds with tool_calls,
-        executes them via tool_executor and feeds results back. Loops until the LLM
-        produces a final text response (no more tool_calls) or budget is exhausted.
+        Handles both OpenAI-format tool_calls and Qwen's native <tool_call> XML fallback.
+        Loops until the LLM produces a final text response or budget is exhausted.
 
         Returns the final response dict (the one with text content, not tool calls).
         """
+        import json as _json
+        import re as _re
+
         if self._client is None:
             raise RuntimeError("LLMBackend not started")
 
         conversation = list(messages)
         total_result_tokens = 0
 
-        for _round in range(max_rounds):
-            response = await self._client.chat.completions.create(
-                model=self.config.active_model,
-                messages=conversation,
-                tools=tools,
-                temperature=self.config.llamacpp.temp if self.config.backend == "llamacpp" else 0.0,
-                max_tokens=self.config.llamacpp.max_tokens if self.config.backend == "llamacpp" else 4096,
+        def _parse_native_xml(content: str) -> list[dict] | None:
+            """Parse Qwen native <tool_call> XML into a list of {name, arguments} dicts.
+
+            Returns None if no tool calls found.
+            """
+            pattern = _re.compile(
+                r"<tool_call>\s*<function=(?P<name>\w+)>(?P<body>.*?)</function>\s*</tool_call>",
+                _re.DOTALL,
             )
+            matches = list(pattern.finditer(content))
+            if not matches:
+                return None
+            calls = []
+            for m in matches:
+                name = m.group("name")
+                body = m.group("body")
+                params = {}
+                for pm in _re.finditer(r"<parameter=(?P<k>\w+)>\s*(?P<v>.*?)\s*</parameter>", body, _re.DOTALL):
+                    params[pm.group("k")] = pm.group("v").strip()
+                calls.append({"name": name, "arguments": params})
+            return calls
 
-            choice = response.choices[0]
+        def _llm_kwargs() -> dict:
+            return {
+                "model": self.config.active_model,
+                "temperature": self.config.llamacpp.temp if self.config.backend == "llamacpp" else 0.0,
+                "max_tokens": self.config.llamacpp.max_tokens if self.config.backend == "llamacpp" else 4096,
+            }
 
-            # If no tool calls, this is the final response
-            if not choice.message.tool_calls:
-                return response.model_dump()
+        def _execute_calls(calls_openai: list | None, calls_native: list | None) -> bool:
+            """Execute tool calls (OpenAI or native), append results. Returns True if budget hit."""
+            nonlocal total_result_tokens
+            items = []
+            if calls_openai:
+                for tc in calls_openai:
+                    args = _json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                    items.append((tc.function.name, args, tc.id))
+            elif calls_native:
+                for nc in calls_native:
+                    items.append((nc["name"], nc["arguments"], f"native_{nc['name']}"))
 
-            # Add assistant message with tool calls to conversation
-            conversation.append(choice.message.model_dump())
-
-            # Execute each tool call
-            for tc in choice.message.tool_calls:
-                import json as _json
-                args = _json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
-                result = tool_executor(tc.function.name, args)
-                result_tokens = len(result) // 4
-                total_result_tokens += result_tokens
-
-                log.info(
-                    "Tool call: %s(%s) → %d tokens (total: %d/%d)",
-                    tc.function.name, tc.function.arguments,
-                    result_tokens, total_result_tokens, max_result_tokens,
-                )
-
-                conversation.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
-
+            for name, args, call_id in items:
+                result = tool_executor(name, args)
+                tokens = len(result) // 4
+                total_result_tokens += tokens
+                log.info("Tool call: %s(%s) → %d tokens (total: %d/%d)", name, args, tokens, total_result_tokens, max_result_tokens)
+                conversation.append({"role": "tool", "tool_call_id": call_id, "content": result})
                 if total_result_tokens >= max_result_tokens:
                     log.warning("Tool result token budget exhausted (%d)", total_result_tokens)
+                    return True
+            return False
+
+        for _round in range(max_rounds):
+            response = await self._client.chat.completions.create(
+                messages=conversation, tools=tools, **_llm_kwargs()
+            )
+            choice = response.choices[0]
+            content = choice.message.content or ""
+
+            # OpenAI-format tool calls
+            if choice.message.tool_calls:
+                conversation.append(choice.message.model_dump())
+                if _execute_calls(choice.message.tool_calls, None):
                     break
+                continue
 
-            if total_result_tokens >= max_result_tokens:
-                break
+            # Qwen native XML fallback
+            native_calls = _parse_native_xml(content)
+            if native_calls:
+                log.info("Detected %d native XML tool call(s) — executing", len(native_calls))
+                conversation.append({"role": "assistant", "content": content})
+                if _execute_calls(None, native_calls):
+                    break
+                continue
 
-        # Budget exhausted — do one final call without tools to force a decision
-        log.warning("Tool rounds exhausted — forcing final response without tools")
+            # No tool calls — this is the final response
+            return response.model_dump()
+
+        # Budget exhausted — explicitly tell the model to stop calling tools and answer
+        log.warning("Tool rounds exhausted — sending explicit stop instruction")
+        conversation.append({
+            "role": "user",
+            "content": "Stop calling tools. You have enough context. Return ONLY the JSON decision object now, no tool calls.",
+        })
         response = await self._client.chat.completions.create(
-            model=self.config.active_model,
-            messages=conversation,
-            temperature=self.config.llamacpp.temp if self.config.backend == "llamacpp" else 0.0,
-            max_tokens=self.config.llamacpp.max_tokens if self.config.backend == "llamacpp" else 4096,
+            messages=conversation, **_llm_kwargs()
         )
         return response.model_dump()
 
