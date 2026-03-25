@@ -93,6 +93,84 @@ class LLMBackend:
         # Return as dict for uniform handling downstream
         return response.model_dump()
 
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        tool_executor: Any,  # callable(name, args) -> str
+        *,
+        max_rounds: int = 5,
+        max_result_tokens: int = 16000,
+    ) -> dict[str, Any]:
+        """Multi-turn tool-use loop.
+
+        Sends messages with tool definitions. If the LLM responds with tool_calls,
+        executes them via tool_executor and feeds results back. Loops until the LLM
+        produces a final text response (no more tool_calls) or budget is exhausted.
+
+        Returns the final response dict (the one with text content, not tool calls).
+        """
+        if self._client is None:
+            raise RuntimeError("LLMBackend not started")
+
+        conversation = list(messages)
+        total_result_tokens = 0
+
+        for _round in range(max_rounds):
+            response = await self._client.chat.completions.create(
+                model=self.config.active_model,
+                messages=conversation,
+                tools=tools,
+                temperature=self.config.llamacpp.temp if self.config.backend == "llamacpp" else 0.0,
+                max_tokens=self.config.llamacpp.max_tokens if self.config.backend == "llamacpp" else 4096,
+            )
+
+            choice = response.choices[0]
+
+            # If no tool calls, this is the final response
+            if not choice.message.tool_calls:
+                return response.model_dump()
+
+            # Add assistant message with tool calls to conversation
+            conversation.append(choice.message.model_dump())
+
+            # Execute each tool call
+            for tc in choice.message.tool_calls:
+                import json as _json
+                args = _json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                result = tool_executor(tc.function.name, args)
+                result_tokens = len(result) // 4
+                total_result_tokens += result_tokens
+
+                log.info(
+                    "Tool call: %s(%s) → %d tokens (total: %d/%d)",
+                    tc.function.name, tc.function.arguments,
+                    result_tokens, total_result_tokens, max_result_tokens,
+                )
+
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+                if total_result_tokens >= max_result_tokens:
+                    log.warning("Tool result token budget exhausted (%d)", total_result_tokens)
+                    break
+
+            if total_result_tokens >= max_result_tokens:
+                break
+
+        # Budget exhausted — do one final call without tools to force a decision
+        log.warning("Tool rounds exhausted — forcing final response without tools")
+        response = await self._client.chat.completions.create(
+            model=self.config.active_model,
+            messages=conversation,
+            temperature=self.config.llamacpp.temp if self.config.backend == "llamacpp" else 0.0,
+            max_tokens=self.config.llamacpp.max_tokens if self.config.backend == "llamacpp" else 4096,
+        )
+        return response.model_dump()
+
     # ── Internal helpers ───────────────────────────────────────────────────
 
     def _build_llamacpp_cmd(self) -> list[str]:

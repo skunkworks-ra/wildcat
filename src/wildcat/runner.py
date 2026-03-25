@@ -9,6 +9,7 @@ filesystem watchers needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -70,10 +71,22 @@ class CASARunner:
 
         outcome = "done" if returncode == 0 else "failed"
 
+        stdout_text = "\n".join(stdout_lines)
         self.db.update_job(
             job_id,
             status=outcome,
-            stdout="\n".join(stdout_lines),
+            stdout=stdout_text,
             stderr="\n".join(stderr_lines),
         )
+
+        if outcome == "done":
+            for line in stdout_lines:
+                if line.startswith("WILDCAT_METRICS:"):
+                    try:
+                        metrics = json.loads(line[len("WILDCAT_METRICS:"):].strip())
+                        self.db.update_job_metrics(job_id, json.dumps(metrics))
+                    except json.JSONDecodeError:
+                        log.warning("Job %d: malformed WILDCAT_METRICS line", job_id)
+                    break
+
         log.info("Job %d finished with outcome=%s", job_id, outcome)

@@ -1,5 +1,8 @@
 [llm]
 backend = "llamacpp"        # "llamacpp" | "ollama"
+max_user_tokens = 16000     # token budget for user content
+max_retries     = 5         # LLM call retries on empty/invalid response
+max_tool_rounds = 5         # max internal tool calls per LLM decision (tool-use mode)
 
 [llm.llamacpp]
 base_url     = "http://localhost:8080/v1"

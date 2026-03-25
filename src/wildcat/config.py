@@ -36,6 +36,9 @@ class LLMConfig:
     backend: str  # "llamacpp" | "ollama"
     llamacpp: LlamaCppConfig
     ollama: OllamaConfig
+    max_user_tokens: int = 16000
+    max_retries: int = 5
+    max_tool_rounds: int = 5
 
     @property
     def active_base_url(self) -> str:
@@ -100,6 +103,9 @@ def load_config(path: str | Path = "config.toml") -> WildcatConfig:
     return WildcatConfig(
         llm=LLMConfig(
             backend=llm_raw["backend"],
+            max_user_tokens=llm_raw.get("max_user_tokens", 16000),
+            max_retries=llm_raw.get("max_retries", 5),
+            max_tool_rounds=llm_raw.get("max_tool_rounds", 5),
             llamacpp=LlamaCppConfig(
                 base_url=llamacpp_raw["base_url"],
                 model_path=llamacpp_raw["model_path"],

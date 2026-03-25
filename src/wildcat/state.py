@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status       TEXT NOT NULL DEFAULT 'pending',
     stdout       TEXT,
     stderr       TEXT,
+    metrics_json TEXT,
     plots        TEXT,
     queued_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
     started_at   DATETIME,
@@ -131,6 +132,7 @@ class StateDB:
         for stmt in (
             f"ALTER TABLE workflow ADD COLUMN workflow_config TEXT NOT NULL DEFAULT '{_WORKFLOW_CONFIG_DEFAULT}'",
             "ALTER TABLE checkpoints ADD COLUMN question_answers TEXT",
+            "ALTER TABLE jobs ADD COLUMN metrics_json TEXT",
         ):
             try:
                 self.conn.execute(stmt)
@@ -232,6 +234,51 @@ class StateDB:
             (status, stdout, stderr, plots, job_id),
         )
         self.conn.commit()
+
+    def update_job_metrics(self, job_id: int, metrics_json: str) -> None:
+        """Store parsed WILDCAT_METRICS JSON on a completed job."""
+        self.conn.execute(
+            "UPDATE jobs SET metrics_json = ? WHERE id = ?",
+            (metrics_json, job_id),
+        )
+        self.conn.commit()
+
+    def get_last_job_metrics(
+        self, workflow_id: int, stage: str | None = None
+    ) -> dict:
+        """Return parsed metrics from the most recent completed job.
+
+        When stage is given, only jobs for that stage are considered.
+        """
+        if stage:
+            row = self.conn.execute(
+                "SELECT metrics_json, stdout FROM jobs"
+                " WHERE workflow_id = ? AND stage = ? AND status = 'done'"
+                " ORDER BY completed_at DESC LIMIT 1",
+                (workflow_id, stage),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT metrics_json, stdout FROM jobs"
+                " WHERE workflow_id = ? AND status = 'done'"
+                " ORDER BY completed_at DESC LIMIT 1",
+                (workflow_id,),
+            ).fetchone()
+        if not row:
+            return {}
+        if row["metrics_json"]:
+            try:
+                return json.loads(row["metrics_json"])
+            except json.JSONDecodeError:
+                pass
+        if row["stdout"]:
+            for line in row["stdout"].splitlines():
+                if line.startswith("WILDCAT_METRICS:"):
+                    try:
+                        return json.loads(line[len("WILDCAT_METRICS:"):].strip())
+                    except json.JSONDecodeError:
+                        pass
+        return {}
 
     # ── Checkpoints ───────────────────────────────────────────────────────
 

@@ -645,6 +645,76 @@ _CAL_STAGE_TOOLS: dict[Stage, set[str]] = {
 }
 
 
+# ── Internal tools for LLM-driven context querying ───────────────────────
+# These are passed to the LLM as OpenAI-compatible function definitions.
+# The LLM calls them to pull context it needs for its decision.
+
+_INTERNAL_TOOLS_OPENAI = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_metrics",
+            "description": "Get WILDCAT_METRICS from a completed CASA job for a given stage",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stage": {
+                        "type": "string",
+                        "description": "Stage name, e.g. CALIBRATION_PREFLAG or CALIBRATION_SOLVE",
+                    },
+                },
+                "required": ["stage"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_previous_script",
+            "description": "Get the CASA script from the most recent completed job for a given stage",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stage": {
+                        "type": "string",
+                        "description": "Stage name, e.g. CALIBRATION_PREFLAG",
+                    },
+                },
+                "required": ["stage"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_tool_output",
+            "description": "Get a Phase 1-3 inspection tool output by name (e.g. ms_field_list)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Tool name, e.g. ms_field_list, ms_spectral_window_list",
+                    },
+                },
+                "required": ["tool_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_workflow_config",
+            "description": "Get the current workflow configuration (polcal, aggressive_flagging, preflag_iterations)",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+# Stages that use the multi-turn tool-use pattern (others keep single-turn)
+_TOOL_USE_STAGES = {Stage.CALIBRATION_PREFLAG, Stage.POLCAL_SOLVE}
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -655,6 +725,10 @@ class Orchestrator:
         runner: CASARunner,
         checkpoint_event: asyncio.Event,
         stop_event: asyncio.Event | None = None,
+        *,
+        max_user_tokens: int = 16000,
+        max_retries: int = 5,
+        max_tool_rounds: int = 5,
     ) -> None:
         self.db = db
         self.tools = tools
@@ -663,6 +737,9 @@ class Orchestrator:
         self.runner = runner
         self.checkpoint_event = checkpoint_event
         self.stop_event = stop_event or asyncio.Event()
+        self.max_user_tokens = max_user_tokens
+        self.max_retries = max_retries
+        self.max_tool_rounds = max_tool_rounds
 
     # ── Main loop ──────────────────────────────────────────────────────────
 
@@ -919,44 +996,56 @@ class Orchestrator:
             self.db.transition(workflow_id, Stage.CALIBRATION_CHECKPOINT)
             return
 
-        # 1. Build context: minimal but sufficient for autonomous decision.
-        #    PREFLAG re-entry (iteration 2+): send previous script + metrics only.
-        #    Tool outputs are static across iterations — they are already baked into
-        #    the prior script's filled placeholder values.
-        prev_metrics = self._read_last_job_metrics(workflow_id)
         instruction = _JSON_INSTRUCTIONS_BY_STAGE[stage]
+        system_prompt = load_system_prompt(self.skills_path, stage)
 
-        is_preflag_reentry = (stage == Stage.CALIBRATION_PREFLAG and preflag_iterations > 1)
-        if is_preflag_reentry:
-            prev_script = self._get_previous_preflag_script(workflow_id)
-            user_content = self._format_preflag_reentry_prompt(
-                wf["ms_path"], prev_metrics, wf_config, prev_script, preflag_iterations
+        # 1. Build minimal base context — the LLM can query for more via tools
+        is_reentry = stage == Stage.CALIBRATION_PREFLAG and preflag_iterations > 1
+        base_lines = [
+            f"## Calibration stage: {stage.value}",
+            f"Measurement set: {wf['ms_path']}",
+            f"Preflag iterations: {preflag_iterations} / {_PREFLAG_MAX_ITERATIONS}",
+        ]
+
+        # Always include the template (LLM needs it to produce the script)
+        template = _TEMPLATES_BY_STAGE.get(stage)
+        if template:
+            tmpl = template.replace("{WORKFLOW_ID}", str(workflow_id))
+            base_lines.append("\n## Script template")
+            base_lines.append("Complete the script by replacing ALL {PLACEHOLDER} values.")
+            base_lines.append("Do NOT modify sections marked [DETERMINISTIC].")
+            base_lines.append(f"```python\n{tmpl}\n```")
+
+        if is_reentry:
+            base_lines.append(
+                "\nThis is a re-entry: the previous PREFLAG pass didn't produce clean enough "
+                "calibration. Use the tools to retrieve the previous script and metrics, then "
+                "adjust flagging parameters and return a new script."
             )
         else:
-            phase_outputs = self._load_all_tool_outputs(workflow_id, tools=_CAL_STAGE_TOOLS.get(stage))
-            template = _TEMPLATES_BY_STAGE[stage].replace('{WORKFLOW_ID}', str(workflow_id))
-            user_content = self._format_calibration_prompt(
-                stage, wf["ms_path"], prev_metrics, phase_outputs, wf_config, template, preflag_iterations
+            base_lines.append(
+                "\nUse the tools to retrieve Phase 1-3 tool outputs (ms_field_list, "
+                "ms_spectral_window_list, ms_correlator_config) and the workflow config, "
+                "then fill the template and return your decision."
             )
 
-        system_prompt = load_system_prompt(self.skills_path, stage)
-        # /no_think disables Qwen3 chain-of-thought for structured JSON outputs
+        user_content = "\n".join(base_lines)
+        system_with_instruction = system_prompt + "\n\n" + instruction + "\n\n/no_think"
         messages = [
-            {"role": "system", "content": system_prompt + "\n\n" + instruction + "\n\n/no_think"},
-            {"role": "user",   "content": user_content},
+            {"role": "system", "content": system_with_instruction},
+            {"role": "user", "content": user_content},
         ]
 
         if self.stop_event.is_set():
             self.db.transition(workflow_id, Stage.STOPPED)
             return
 
-        # 2. LLM call
-        response = await self.llm.complete(messages)
-        raw_decision = self._extract_content(response)
-        decision = self._parse_decision(raw_decision)
-
-        model = response.get("model", "unknown")
-        self.db.save_llm_decision(workflow_id, stage.value, json.dumps(decision), model)
+        # 2. LLM call with tools and retry
+        decision, model = await self._llm_call_with_retry_and_tools(
+            workflow_id, stage, messages
+        )
+        if decision is None:
+            return
 
         # 3. Validate next_stage is legal for this stage
         next_stage_str = decision["next_stage"]
@@ -978,10 +1067,9 @@ class Orchestrator:
             if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
                 return
 
-        # 4b. Flag fraction cap: if PREFLAG wants to loop but data is too heavily flagged,
-        #     force-advance to CALIBRATION_SOLVE rather than destroying more data.
+        # 4b. Flag fraction cap
         if stage == Stage.CALIBRATION_PREFLAG and next_stage_str == Stage.CALIBRATION_PREFLAG.value:
-            current_metrics = self._read_last_job_metrics(workflow_id)
+            current_metrics = self.db.get_last_job_metrics(workflow_id, Stage.CALIBRATION_PREFLAG.value)
             flag_frac = current_metrics.get("overall_flag_frac", 0.0)
             if isinstance(flag_frac, (int, float)) and flag_frac >= _PREFLAG_FLAG_CAP:
                 log.warning(
@@ -990,9 +1078,7 @@ class Orchestrator:
                 )
                 next_stage_str = Stage.CALIBRATION_SOLVE.value
 
-        # 4c. Polcal routing: when CALIBRATION_PREFLAG advances to CALIBRATION_SOLVE,
-        #     redirect to POLCAL_SOLVE if polcal=True and feasibility verdict is viable.
-        #     Logs reason when polcal is skipped (NOT_FEASIBLE or LEAKAGE_ONLY).
+        # 4c. Polcal routing
         if stage == Stage.CALIBRATION_PREFLAG and next_stage_str == Stage.CALIBRATION_SOLVE.value:
             if wf_config.get("polcal"):
                 polcal_verdict = self._get_polcal_verdict(workflow_id)
@@ -1010,6 +1096,106 @@ class Orchestrator:
 
         # 5. Transition
         self.db.transition(workflow_id, Stage(next_stage_str))
+
+    # ── Internal tool executor ─────────────────────────────────────────────
+
+    def _execute_internal_tool(self, workflow_id: int, tool_name: str, args: dict) -> str:
+        """Dispatch an internal tool call and return the result as a JSON string."""
+        if tool_name == "get_metrics":
+            stage_filter = args.get("stage")
+            metrics = self.db.get_last_job_metrics(workflow_id, stage_filter)
+            return json.dumps(metrics, indent=2) if metrics else '{"error": "no metrics found"}'
+
+        if tool_name == "get_previous_script":
+            stage_filter = args.get("stage", "CALIBRATION_PREFLAG")
+            row = self.db.conn.execute(
+                "SELECT script_path FROM jobs"
+                " WHERE workflow_id = ? AND stage = ? AND status = 'done'"
+                " ORDER BY id DESC LIMIT 1",
+                (workflow_id, stage_filter),
+            ).fetchone()
+            if row and row["script_path"]:
+                try:
+                    with open(row["script_path"]) as f:
+                        return f.read()
+                except OSError:
+                    pass
+            return '{"error": "no script found"}'
+
+        if tool_name == "get_tool_output":
+            tn = args.get("tool_name", "")
+            outputs = self._load_all_tool_outputs(workflow_id, tools={tn})
+            if tn in outputs:
+                return json.dumps(outputs[tn], indent=2)
+            return f'{{"error": "tool output {tn} not found"}}'
+
+        if tool_name == "get_workflow_config":
+            return json.dumps(self.db.get_workflow_config(workflow_id), indent=2)
+
+        return f'{{"error": "unknown tool {tool_name}"}}'
+
+    # ── LLM retry with tool use ───────────────────────────────────────────
+
+    async def _llm_call_with_retry_and_tools(
+        self, workflow_id: int, stage: Stage, messages: list[dict]
+    ) -> tuple[dict | None, str]:
+        """Call the LLM with internal tools, retrying on failure.
+
+        For stages in _TOOL_USE_STAGES, uses multi-turn tool calling.
+        For other stages, falls back to simple single-turn calls.
+        Returns (decision_dict, model_str) or (None, "") on total failure.
+        """
+        use_tools = stage in _TOOL_USE_STAGES
+        last_error = ""
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                if use_tools:
+                    response = await self.llm.complete_with_tools(
+                        messages,
+                        tools=_INTERNAL_TOOLS_OPENAI,
+                        tool_executor=lambda name, args: self._execute_internal_tool(
+                            workflow_id, name, args
+                        ),
+                        max_rounds=self.max_tool_rounds,
+                        max_result_tokens=self.max_user_tokens,
+                    )
+                else:
+                    response = await self.llm.complete(messages)
+
+                raw = self._extract_content(response)
+                if not raw or not raw.strip():
+                    raise ValueError("LLM returned empty response")
+                decision = self._parse_decision(raw)
+                model = response.get("model", "unknown")
+                self.db.save_llm_decision(
+                    workflow_id, stage.value, json.dumps(decision), model
+                )
+                if attempt > 1:
+                    log.info(
+                        "Workflow %d: LLM succeeded on attempt %d/%d for %s",
+                        workflow_id, attempt, self.max_retries, stage.value,
+                    )
+                return decision, model
+
+            except (ValueError, KeyError) as exc:
+                last_error = str(exc)
+                log.warning(
+                    "Workflow %d: LLM attempt %d/%d failed for %s — %s",
+                    workflow_id, attempt, self.max_retries, stage.value, last_error,
+                )
+                self.db.save_llm_decision(
+                    workflow_id, stage.value,
+                    json.dumps({"_retry_error": last_error, "_attempt": attempt}),
+                    "retry",
+                )
+
+        log.error(
+            "Workflow %d: all %d LLM retries exhausted for %s — entering ERROR. Last: %s",
+            workflow_id, self.max_retries, stage.value, last_error,
+        )
+        self.db.transition(workflow_id, Stage.ERROR)
+        return None, ""
 
     # ── Deterministic CALIBRATION_SOLVE ───────────────────────────────────
 
@@ -1037,7 +1223,7 @@ class Orchestrator:
         if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
             return
 
-        metrics = self._read_last_job_metrics(workflow_id)
+        metrics = self.db.get_last_job_metrics(workflow_id, Stage.CALIBRATION_SOLVE.value)
         bp_frac   = float(metrics.get("bp_flagged_frac",   1.0))
         gain_frac = float(metrics.get("gain_flagged_frac", 1.0))
 
@@ -1130,7 +1316,7 @@ class Orchestrator:
     def _solve_cal_scan_ids(self, outputs: dict, field_id: str) -> str:
         """Return comma-separated scan numbers on field_id from the scan list."""
         scans = outputs.get("ms_scan_list", {}).get("data", {}).get("scans", [])
-        ids = [s["scan_number"] for s in scans if str(s.get("field_id")) == field_id]
+        ids = [str(s["scan_number"]) for s in scans if str(s.get("field_id")) == field_id]
         return ",".join(ids) if ids else "1"
 
     def _solve_best_refant(self, outputs: dict) -> str:
@@ -1169,8 +1355,8 @@ class Orchestrator:
             return
 
         # Read metrics from both stages for the LLM summary
-        apply_metrics = self._read_job_metrics_for_stage(workflow_id, Stage.CALIBRATION_APPLY.value)
-        solve_metrics = self._read_job_metrics_for_stage(workflow_id, Stage.CALIBRATION_SOLVE.value)
+        apply_metrics = self.db.get_last_job_metrics(workflow_id, Stage.CALIBRATION_APPLY.value)
+        solve_metrics = self.db.get_last_job_metrics(workflow_id, Stage.CALIBRATION_SOLVE.value)
 
         user_content = (
             "## CALIBRATION_SOLVE metrics\n```json\n"
@@ -1185,13 +1371,11 @@ class Orchestrator:
             {"role": "user",   "content": user_content},
         ]
 
-        response = await self.llm.complete(messages)
-        raw = self._extract_content(response)
-        decision = self._parse_decision(raw)
-        model = response.get("model", "unknown")
-        self.db.save_llm_decision(
-            workflow_id, Stage.CALIBRATION_APPLY.value, json.dumps(decision), model
+        decision, _model = await self._llm_call_with_retry_and_tools(
+            workflow_id, Stage.CALIBRATION_APPLY, messages
         )
+        if decision is None:
+            return
 
         self.db.transition(workflow_id, Stage.CALIBRATION_CHECKPOINT)
 
@@ -1232,24 +1416,6 @@ class Orchestrator:
         for placeholder, value in subs.items():
             script = script.replace(placeholder, value)
         return script
-
-    def _read_job_metrics_for_stage(self, workflow_id: int, stage_label: str) -> dict:
-        """Parse WILDCAT_METRICS from the most recent completed job for a given stage."""
-        row = self.db.conn.execute(
-            "SELECT stdout FROM jobs"
-            " WHERE workflow_id = ? AND stage = ? AND status = 'done'"
-            " ORDER BY completed_at DESC LIMIT 1",
-            (workflow_id, stage_label),
-        ).fetchone()
-        if not row or not row["stdout"]:
-            return {}
-        for line in row["stdout"].splitlines():
-            if line.startswith("WILDCAT_METRICS:"):
-                try:
-                    return json.loads(line[len("WILDCAT_METRICS:"):].strip())
-                except json.JSONDecodeError:
-                    pass
-        return {}
 
     # ── Checkpoint handler ─────────────────────────────────────────────────
 
@@ -1339,23 +1505,6 @@ class Orchestrator:
                     pass
         return None
 
-    def _read_last_job_metrics(self, workflow_id: int) -> dict:
-        """Parse WILDCAT_METRICS from the most recent completed job's stdout."""
-        row = self.db.conn.execute(
-            "SELECT stdout FROM jobs WHERE workflow_id = ? AND status = 'done'"
-            " ORDER BY completed_at DESC LIMIT 1",
-            (workflow_id,),
-        ).fetchone()
-        if not row or not row["stdout"]:
-            return {}
-        for line in row["stdout"].splitlines():
-            if line.startswith("WILDCAT_METRICS:"):
-                try:
-                    return json.loads(line[len("WILDCAT_METRICS:"):].strip())
-                except json.JSONDecodeError:
-                    pass
-        return {}
-
     def _load_all_tool_outputs(
         self, workflow_id: int, tools: set[str] | None = None
     ) -> dict[str, dict]:
@@ -1375,47 +1524,6 @@ class Orchestrator:
                     pass
         return outputs
 
-    def _format_calibration_prompt(
-        self,
-        stage: Stage,
-        ms_path: str,
-        prev_metrics: dict,
-        tool_outputs: dict[str, dict],
-        wf_config: dict,
-        template: str,
-        preflag_iterations: int,
-    ) -> str:
-        """Build the user_content for a calibration stage LLM call."""
-        lines: list[str] = []
-
-        lines.append(f"## Calibration stage: {stage.value}")
-        lines.append(f"Measurement set: {ms_path}")
-        lines.append(f"Workflow config: {json.dumps(wf_config)}")
-        if preflag_iterations:
-            lines.append(f"Preflag iterations so far: {preflag_iterations} / {_PREFLAG_MAX_ITERATIONS}")
-
-        if prev_metrics:
-            lines.append("\n## Previous job metrics (WILDCAT_METRICS)")
-            lines.append("```json")
-            lines.append(json.dumps(prev_metrics, indent=2))
-            lines.append("```")
-
-        lines.append("\n## Phase 1-3 tool outputs (use to fill template placeholders)")
-        for tool_name, data in tool_outputs.items():
-            lines.append(f"### {tool_name}")
-            lines.append("```json")
-            lines.append(json.dumps(data, indent=2))
-            lines.append("```")
-
-        lines.append("\n## Script template")
-        lines.append("Complete the script by replacing ALL {PLACEHOLDER} values.")
-        lines.append("Do NOT modify sections marked [DETERMINISTIC].")
-        lines.append("```python")
-        lines.append(template)
-        lines.append("```")
-
-        return "\n".join(lines)
-
     def _get_previous_preflag_script(self, workflow_id: int) -> str:
         """Read the script content from the most recent completed CALIBRATION_PREFLAG job."""
         row = self.db.conn.execute(
@@ -1431,43 +1539,6 @@ class Orchestrator:
             except OSError:
                 pass
         return ""
-
-    def _format_preflag_reentry_prompt(
-        self,
-        ms_path: str,
-        prev_metrics: dict,
-        wf_config: dict,
-        prev_script: str,
-        preflag_iterations: int,
-    ) -> str:
-        """Minimal re-entry prompt for CALIBRATION_PREFLAG iterations 2+.
-
-        Sends the previous filled script + outcome metrics only.
-        Tool outputs omitted — they are static and already encoded in the prior script.
-        The JSON response schema is in the system prompt.
-        """
-        lines: list[str] = []
-        lines.append(f"## CALIBRATION_PREFLAG — iteration {preflag_iterations} / {_PREFLAG_MAX_ITERATIONS}")
-        lines.append(f"Measurement set: {ms_path}")
-        lines.append(f"Workflow config: {json.dumps(wf_config)}")
-
-        if prev_script:
-            lines.append("\n## Script from previous run")
-            lines.append("```python")
-            lines.append(prev_script)
-            lines.append("```")
-
-        if prev_metrics:
-            lines.append("\n## Outcome (WILDCAT_METRICS)")
-            lines.append("```json")
-            lines.append(json.dumps(prev_metrics, indent=2))
-            lines.append("```")
-
-        lines.append(
-            "\nAdjust the flagging parameters based on the outcome above and return a new script. "
-            "Respond using the JSON schema specified in the system prompt."
-        )
-        return "\n".join(lines)
 
     # ── Parsing helpers ────────────────────────────────────────────────────
 
