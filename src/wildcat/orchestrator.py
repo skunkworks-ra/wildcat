@@ -27,8 +27,11 @@ from wildcat.tools import MSInspectClient
 
 log = logging.getLogger(__name__)
 
-# JSON schema that every LLM response must conform to
-_DECISION_SCHEMA_KEYS = {"next_stage", "summary", "reasoning"}  # casa_script is optional
+# Required keys per stage — APPLY has a different schema (checkpoint_questions, no next_stage)
+_DECISION_SCHEMA_KEYS = {"next_stage", "summary", "reasoning"}  # default
+_DECISION_SCHEMA_KEYS_BY_STAGE: dict[str, set[str]] = {
+    Stage.CALIBRATION_APPLY.value: {"summary", "checkpoint_questions"},
+}
 
 # ── Per-stage JSON instructions ─────────────────────────────────────────────
 
@@ -1206,11 +1209,12 @@ class Orchestrator:
             return self._get_previous_preflag_script(workflow_id) or ""
 
         if spec.source == "template":
-            tmpl = _TEMPLATES_BY_STAGE.get(stage, "")
+            stage_key = Stage(spec.template_key) if spec.template_key else None
+            tmpl = _TEMPLATES_BY_STAGE.get(stage_key, "") if stage_key else ""
             if not tmpl:
                 return ""
             tmpl = tmpl.replace("{WORKFLOW_ID}", str(workflow_id))
-            if stage == Stage.CALIBRATION_PREFLAG:
+            if stage_key == Stage.CALIBRATION_PREFLAG:
                 tmpl = self._prefill_preflag_template(workflow_id, tmpl)
             return (
                 "Complete the script by replacing ALL {PLACEHOLDER} values.\n"
@@ -1241,7 +1245,7 @@ class Orchestrator:
                 raw = self._extract_content(response)
                 if not raw or not raw.strip():
                     raise ValueError("LLM returned empty response")
-                decision = self._parse_decision(raw)
+                decision = self._parse_decision(raw, stage)
                 model = response.get("model", "unknown")
                 self.db.save_llm_decision(
                     workflow_id, stage.value, json.dumps(decision), model
@@ -1671,7 +1675,7 @@ class Orchestrator:
 
     # ── Parsing helpers ────────────────────────────────────────────────────
 
-    def _parse_decision(self, raw: str) -> dict:
+    def _parse_decision(self, raw: str, stage: Stage | None = None) -> dict:
         """Extract and validate the LLM JSON decision."""
         # Strip Qwen3 thinking blocks (<think>...</think>) before parsing
         text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
@@ -1684,7 +1688,10 @@ class Orchestrator:
         except json.JSONDecodeError as exc:
             raise ValueError(f"LLM response is not valid JSON: {exc}\n---\n{raw}") from exc
 
-        missing = _DECISION_SCHEMA_KEYS - decision.keys()
+        required = _DECISION_SCHEMA_KEYS_BY_STAGE.get(
+            stage.value if stage else "", _DECISION_SCHEMA_KEYS
+        )
+        missing = required - decision.keys()
         if missing:
             raise ValueError(f"LLM decision missing required keys: {missing}")
 
