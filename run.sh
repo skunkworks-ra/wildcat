@@ -159,15 +159,18 @@ EOF
 
 # ── Step 7: Wait for wildcat to reach a checkpoint or terminal state ─────────
 step "Waiting for wildcat to reach CALIBRATION_CHECKPOINT (or terminal state)"
+echo "  (Ctrl+C to stop watching — pipeline continues in container)"
 
-for i in $(seq 1 240); do
+i=0
+while true; do
+    i=$((i + 1))
     STAGE=$(python3 -c "
 import sqlite3
 con = sqlite3.connect('/home/pjaganna/Data/wildcat-output/wildcat.db')
 row = con.execute('SELECT stage FROM workflow ORDER BY id DESC LIMIT 1').fetchone()
 print(row[0] if row else 'NONE')
 " 2>/dev/null)
-    echo "  stage: $STAGE ($i/240)"
+    echo "  stage: $STAGE (${i})"
     case "$STAGE" in
         CALIBRATION_CHECKPOINT|HUMAN_CHECKPOINT|IMAGING_PIPELINE|STOPPED|ERROR)
             HAS_CP=$(python3 -c "
@@ -180,10 +183,6 @@ print(row[0] if row else 'none')
             break
             ;;
     esac
-    if [ "$i" -eq 240 ]; then
-        warn "Timed out — wildcat logs:"
-        podman exec wildcat-test cat /var/log/wildcat.log | tail -20
-    fi
     sleep 5
 done
 

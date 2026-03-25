@@ -285,8 +285,10 @@ bandpass(
 )
 
 # [DETERMINISTIC] Flag bad bandpass solutions with rflag
+# datacolumn='CPARAM' required: cal tables have no DATA column
 flagdata(
     vis=t_bp, mode='rflag',
+    datacolumn='CPARAM',
     winsize=3, timedevscale=4.0, freqdevscale=4.0,
     action='apply', flagbackup=False,
 )
@@ -498,7 +500,8 @@ bandpass(
 
 # [DETERMINISTIC] Flag bad bandpass solutions
 bp_flag_before = flagdata(caltable=t_bp, mode='summary', action='calculate')
-flagdata(vis=t_bp, mode='rflag', winsize=3, timedevscale=4.0, freqdevscale=4.0,
+flagdata(vis=t_bp, mode='rflag', datacolumn='CPARAM',
+         winsize=3, timedevscale=4.0, freqdevscale=4.0,
          action='apply', flagbackup=False)
 bp_flag_after = flagdata(caltable=t_bp, mode='summary', action='calculate')
 bp_flagged_frac = bp_flag_after.get('flagged', 0) / max(bp_flag_after.get('total', 1), 1)
@@ -898,8 +901,15 @@ class Orchestrator:
         wf_config = self.db.get_workflow_config(workflow_id)
         preflag_iterations = wf_config.get("_preflag_iterations", 0)
 
+        # Increment counter at entry so it counts all PREFLAG runs, regardless of
+        # whether re-entry was driven by the LLM, the flag cap, or SOLVE threshold failure.
+        if stage == Stage.CALIBRATION_PREFLAG:
+            preflag_iterations += 1
+            wf_config["_preflag_iterations"] = preflag_iterations
+            self.db.set_workflow_config(workflow_id, wf_config)
+
         # Enforce preflag iteration cap
-        if stage == Stage.CALIBRATION_PREFLAG and preflag_iterations >= _PREFLAG_MAX_ITERATIONS:
+        if stage == Stage.CALIBRATION_PREFLAG and preflag_iterations > _PREFLAG_MAX_ITERATIONS:
             log.warning(
                 "CALIBRATION_PREFLAG hit cap (%d iterations) for workflow %d — escalating",
                 _PREFLAG_MAX_ITERATIONS, workflow_id,
@@ -909,15 +919,25 @@ class Orchestrator:
             self.db.transition(workflow_id, Stage.CALIBRATION_CHECKPOINT)
             return
 
-        # 1. Build context: previous CASA job metrics + relevant Phase 1-3 tool outputs + workflow_config
+        # 1. Build context: minimal but sufficient for autonomous decision.
+        #    PREFLAG re-entry (iteration 2+): send previous script + metrics only.
+        #    Tool outputs are static across iterations — they are already baked into
+        #    the prior script's filled placeholder values.
         prev_metrics = self._read_last_job_metrics(workflow_id)
-        phase_outputs = self._load_all_tool_outputs(workflow_id, tools=_CAL_STAGE_TOOLS.get(stage))
-        template = _TEMPLATES_BY_STAGE[stage].replace('{WORKFLOW_ID}', str(workflow_id))
         instruction = _JSON_INSTRUCTIONS_BY_STAGE[stage]
 
-        user_content = self._format_calibration_prompt(
-            stage, wf["ms_path"], prev_metrics, phase_outputs, wf_config, template, preflag_iterations
-        )
+        is_preflag_reentry = (stage == Stage.CALIBRATION_PREFLAG and preflag_iterations > 1)
+        if is_preflag_reentry:
+            prev_script = self._get_previous_preflag_script(workflow_id)
+            user_content = self._format_preflag_reentry_prompt(
+                wf["ms_path"], prev_metrics, wf_config, prev_script, preflag_iterations
+            )
+        else:
+            phase_outputs = self._load_all_tool_outputs(workflow_id, tools=_CAL_STAGE_TOOLS.get(stage))
+            template = _TEMPLATES_BY_STAGE[stage].replace('{WORKFLOW_ID}', str(workflow_id))
+            user_content = self._format_calibration_prompt(
+                stage, wf["ms_path"], prev_metrics, phase_outputs, wf_config, template, preflag_iterations
+            )
 
         system_prompt = load_system_prompt(self.skills_path, stage)
         # /no_think disables Qwen3 chain-of-thought for structured JSON outputs
@@ -988,15 +1008,7 @@ class Orchestrator:
                         workflow_id, polcal_verdict,
                     )
 
-        # 5. Update preflag iteration counter
-        if stage == Stage.CALIBRATION_PREFLAG:
-            if next_stage_str == Stage.CALIBRATION_PREFLAG.value:
-                wf_config["_preflag_iterations"] = preflag_iterations + 1
-            else:
-                wf_config["_preflag_iterations"] = 0  # reset on exit
-            self.db.set_workflow_config(workflow_id, wf_config)
-
-        # 6. Transition
+        # 5. Transition
         self.db.transition(workflow_id, Stage(next_stage_str))
 
     # ── Deterministic CALIBRATION_SOLVE ───────────────────────────────────
@@ -1036,11 +1048,21 @@ class Orchestrator:
             )
             self.db.transition(workflow_id, Stage.CALIBRATION_APPLY)
         else:
-            log.warning(
-                "Workflow %d: CALIBRATION_SOLVE thresholds not met (bp=%.3f gain=%.3f) → CALIBRATION_PREFLAG",
-                workflow_id, bp_frac, gain_frac,
-            )
-            self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
+            wf_config = self.db.get_workflow_config(workflow_id)
+            preflag_iterations = wf_config.get("_preflag_iterations", 0)
+            if preflag_iterations >= _PREFLAG_MAX_ITERATIONS:
+                log.warning(
+                    "Workflow %d: CALIBRATION_SOLVE thresholds not met (bp=%.3f gain=%.3f) "
+                    "and PREFLAG cap reached (%d) — escalating to CALIBRATION_APPLY",
+                    workflow_id, bp_frac, gain_frac, preflag_iterations,
+                )
+                self.db.transition(workflow_id, Stage.CALIBRATION_APPLY)
+            else:
+                log.warning(
+                    "Workflow %d: CALIBRATION_SOLVE thresholds not met (bp=%.3f gain=%.3f) → CALIBRATION_PREFLAG",
+                    workflow_id, bp_frac, gain_frac,
+                )
+                self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
 
     def _build_solve_script(self, workflow_id: int) -> str:
         """Fill all CALIBRATION_SOLVE placeholders from Phase 1-3 tool outputs."""
@@ -1086,7 +1108,7 @@ class Orchestrator:
         """
         fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
         for f in fields:
-            if "flux" in f.get("calibrator_role", {}).get("value", []):
+            if "flux" in (f.get("calibrator_role", {}).get("value") or []):
                 return f["field_id"]
         for f in fields:
             if f.get("calibrator_match", {}).get("value"):
@@ -1101,7 +1123,7 @@ class Orchestrator:
         """
         fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
         for f in fields:
-            if "phase" in f.get("calibrator_role", {}).get("value", []):
+            if "phase" in (f.get("calibrator_role", {}).get("value") or []):
                 return f["field_id"]
         return flux_field_id
 
@@ -1117,7 +1139,7 @@ class Orchestrator:
             outputs.get("ms_antenna_flag_fraction", {})
             .get("data", {}).get("per_antenna", [])
         )
-        valid = [a for a in per_ant if a.get("flag_fraction", {}).get("value", 1.0) < 1.0]
+        valid = [a for a in per_ant if (a.get("flag_fraction", {}).get("value") or 1.0) < 1.0]
         if not valid:
             return "ea01"
         return min(valid, key=lambda a: a["flag_fraction"]["value"])["antenna_name"]
@@ -1127,7 +1149,7 @@ class Orchestrator:
         fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
         for f in fields:
             if f["field_id"] == flux_field_id:
-                raw = f.get("flux_standard", {}).get("value", "")
+                raw = f.get("flux_standard", {}).get("value") or ""
                 return self._FLUX_STANDARD_MAP.get(raw, raw)
         return "Perley-Butler 2017"
 
@@ -1392,6 +1414,59 @@ class Orchestrator:
         lines.append(template)
         lines.append("```")
 
+        return "\n".join(lines)
+
+    def _get_previous_preflag_script(self, workflow_id: int) -> str:
+        """Read the script content from the most recent completed CALIBRATION_PREFLAG job."""
+        row = self.db.conn.execute(
+            "SELECT script_path FROM jobs"
+            " WHERE workflow_id = ? AND stage = ? AND status = 'done'"
+            " ORDER BY id DESC LIMIT 1",
+            (workflow_id, Stage.CALIBRATION_PREFLAG.value),
+        ).fetchone()
+        if row and row["script_path"]:
+            try:
+                with open(row["script_path"]) as f:
+                    return f.read()
+            except OSError:
+                pass
+        return ""
+
+    def _format_preflag_reentry_prompt(
+        self,
+        ms_path: str,
+        prev_metrics: dict,
+        wf_config: dict,
+        prev_script: str,
+        preflag_iterations: int,
+    ) -> str:
+        """Minimal re-entry prompt for CALIBRATION_PREFLAG iterations 2+.
+
+        Sends the previous filled script + outcome metrics only.
+        Tool outputs omitted — they are static and already encoded in the prior script.
+        The JSON response schema is in the system prompt.
+        """
+        lines: list[str] = []
+        lines.append(f"## CALIBRATION_PREFLAG — iteration {preflag_iterations} / {_PREFLAG_MAX_ITERATIONS}")
+        lines.append(f"Measurement set: {ms_path}")
+        lines.append(f"Workflow config: {json.dumps(wf_config)}")
+
+        if prev_script:
+            lines.append("\n## Script from previous run")
+            lines.append("```python")
+            lines.append(prev_script)
+            lines.append("```")
+
+        if prev_metrics:
+            lines.append("\n## Outcome (WILDCAT_METRICS)")
+            lines.append("```json")
+            lines.append(json.dumps(prev_metrics, indent=2))
+            lines.append("```")
+
+        lines.append(
+            "\nAdjust the flagging parameters based on the outcome above and return a new script. "
+            "Respond using the JSON schema specified in the system prompt."
+        )
         return "\n".join(lines)
 
     # ── Parsing helpers ────────────────────────────────────────────────────
