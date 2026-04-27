@@ -21,37 +21,38 @@ log = logging.getLogger(__name__)
 
 # Partials always included regardless of stage
 _ALWAYS = [
-    "SKILL.md",
-    "01-workflow.md",
-    "01b-workflow-phase2.md",
+    "wildcat/00-core.md",  # band tables, intent vocab, calibrator roles, workflow skeleton
 ]
 
 # Additional partials by stage group
 _STAGE_EXTRAS: dict[str, list[str]] = {
-    "phase1":      ["02-orientation.md"],
-    "phase2":      ["03-instrument-sanity.md"],
-    "phase3":      ["04-diagnostic-reasoning.md", "05-calibrator-science.md"],
-    "checkpoint":  ["04-diagnostic-reasoning.md", "06-failure-modes.md"],
-    "calibration": ["05-calibrator-science.md", "07-calibration-execution.md", "08-pband-specifics.md"],
-    "polcal":      ["05-calibrator-science.md", "09-polcal-execution.md"],
+    "phase1":              ["wildcat/01-phase1.md"],
+    "phase2":              ["wildcat/02-phase2.md"],
+    "phase3":              ["wildcat/03-phase3.md"],
+    "checkpoint":          ["wildcat/03-phase3.md", "wildcat/08-failure.md"],
+    "calibration_preflag": ["wildcat/04-preflag.md"],
+    "calibration_solve":   ["wildcat/05-solve.md"],
+    "calibration_apply":   ["wildcat/07-apply.md"],
+    "polcal":              ["wildcat/06-polcal.md"],
+    "calibration_loop":    ["wildcat/08-failure.md"],
 }
 
 # Map Stage enum values to stage groups
 _STAGE_TO_GROUP: dict[Stage, str] = {
-    Stage.PHASE1_RUNNING:        "phase1",
-    Stage.PHASE1_COMPLETE:       "phase1",
-    Stage.PHASE2_RUNNING:        "phase2",
-    Stage.PHASE2_COMPLETE:       "phase2",
-    Stage.PHASE3_RUNNING:        "phase3",
-    Stage.PHASE3_COMPLETE:       "phase3",
-    Stage.HUMAN_CHECKPOINT:      "checkpoint",
-    Stage.IMAGING_PIPELINE:      "checkpoint",
-    Stage.CALIBRATION_PREFLAG:   "calibration",
-    Stage.CALIBRATION_SOLVE:     "calibration",
-    Stage.CALIBRATION_APPLY:     "calibration",
-    Stage.POLCAL_SOLVE:          "polcal",
-    Stage.CALIBRATION_CHECKPOINT: "calibration",
-    Stage.CALIBRATION_LOOP:      "calibration",
+    Stage.PHASE1_RUNNING:         "phase1",
+    Stage.PHASE1_COMPLETE:        "phase1",
+    Stage.PHASE2_RUNNING:         "phase2",
+    Stage.PHASE2_COMPLETE:        "phase2",
+    Stage.PHASE3_RUNNING:         "phase3",
+    Stage.PHASE3_COMPLETE:        "phase3",
+    Stage.HUMAN_CHECKPOINT:       "checkpoint",
+    Stage.IMAGING_PIPELINE:       "checkpoint",
+    Stage.CALIBRATION_PREFLAG:    "calibration_preflag",
+    Stage.CALIBRATION_SOLVE:      "calibration_solve",
+    Stage.CALIBRATION_APPLY:      "calibration_apply",
+    Stage.POLCAL_SOLVE:           "polcal",
+    Stage.CALIBRATION_CHECKPOINT: "calibration_apply",
+    Stage.CALIBRATION_LOOP:       "calibration_loop",
 }
 
 

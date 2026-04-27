@@ -15,7 +15,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
 from pathlib import Path
 
 from wildcat.llm import LLMBackend
@@ -1050,7 +1049,7 @@ class Orchestrator:
             )
 
         user_content = "\n".join(base_lines)
-        system_with_instruction = system_prompt + "\n\n" + instruction + "\n\n/no_think"
+        system_with_instruction = system_prompt + "\n\n" + instruction
         messages = [
             {"role": "system", "content": system_with_instruction},
             {"role": "user", "content": user_content},
@@ -1428,7 +1427,7 @@ class Orchestrator:
         )
         system_prompt = load_system_prompt(self.skills_path, Stage.CALIBRATION_APPLY)
         messages = [
-            {"role": "system", "content": system_prompt + "\n\n" + _JSON_INSTRUCTION_APPLY + "\n\n/no_think"},
+            {"role": "system", "content": system_prompt + "\n\n" + _JSON_INSTRUCTION_APPLY},
             {"role": "user",   "content": user_content},
         ]
 
@@ -1629,8 +1628,7 @@ class Orchestrator:
 
     def _parse_decision(self, raw: str) -> dict:
         """Extract and validate the LLM JSON decision."""
-        # Strip Qwen3 thinking blocks (<think>...</think>) before parsing
-        text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        text = raw.strip()
         if text.startswith("```"):
             lines = text.splitlines()
             text = "\n".join(l for l in lines if not l.strip().startswith("```"))
