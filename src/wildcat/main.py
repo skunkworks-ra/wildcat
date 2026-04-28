@@ -14,7 +14,6 @@ import asyncio
 import logging
 import os
 import sys
-from pathlib import Path
 
 import uvicorn
 
@@ -108,7 +107,9 @@ async def main_async() -> None:
         log.info("UI listening on http://0.0.0.0:%d", cfg.ui.port)
 
         if not autostart:
-            log.info("Waiting for start signal — visit http://0.0.0.0:%d/start", cfg.ui.port)
+            log.info(
+                "Waiting for start signal — visit http://0.0.0.0:%d/start", cfg.ui.port
+            )
             await start_event.wait()
             log.info("Start signal received — beginning pipeline")
 
@@ -127,7 +128,6 @@ async def main_async() -> None:
 
         # ── Tools ─────────────────────────────────────────────────────────
         async with MSInspectClient(cfg.mcp.base_url) as tools:
-
             # ── Runner + watcher ─────────────────────────────────────────
             runner = CASARunner(cfg.casa, db)
 

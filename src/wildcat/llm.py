@@ -25,7 +25,7 @@ from wildcat.config import LLMConfig
 log = logging.getLogger(__name__)
 
 _HEALTH_TIMEOUT = 60  # seconds to wait for llama-server /health
-_HEALTH_POLL    = 1.0  # poll interval in seconds
+_HEALTH_POLL = 1.0  # poll interval in seconds
 
 
 class LLMBackend:
@@ -82,13 +82,19 @@ class LLMBackend:
     async def complete(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         """POST to /v1/chat/completions. Returns the parsed response dict."""
         if self._client is None:
-            raise RuntimeError("LLMBackend not started — call await backend.start() first")
+            raise RuntimeError(
+                "LLMBackend not started — call await backend.start() first"
+            )
 
         response = await self._client.chat.completions.create(
             model=self.config.active_model,
             messages=messages,
-            temperature=self.config.llamacpp.temp if self.config.backend == "llamacpp" else 0.0,
-            max_tokens=self.config.llamacpp.max_tokens if self.config.backend == "llamacpp" else 4096,
+            temperature=self.config.llamacpp.temp
+            if self.config.backend == "llamacpp"
+            else 0.0,
+            max_tokens=self.config.llamacpp.max_tokens
+            if self.config.backend == "llamacpp"
+            else 4096,
         )
         # Return as dict for uniform handling downstream
         return response.model_dump()
@@ -119,22 +125,41 @@ class LLMBackend:
         def _llm_kwargs() -> dict:
             return {
                 "model": self.config.active_model,
-                "temperature": self.config.llamacpp.temp if self.config.backend == "llamacpp" else 0.0,
-                "max_tokens": self.config.llamacpp.max_tokens if self.config.backend == "llamacpp" else 4096,
+                "temperature": self.config.llamacpp.temp
+                if self.config.backend == "llamacpp"
+                else 0.0,
+                "max_tokens": self.config.llamacpp.max_tokens
+                if self.config.backend == "llamacpp"
+                else 4096,
             }
 
         def _execute_calls(calls: list) -> bool:
             """Execute OpenAI-format tool calls, append results. Returns True if budget hit."""
             nonlocal total_result_tokens
             for tc in calls:
-                args = _json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+                args = (
+                    _json.loads(tc.function.arguments)
+                    if isinstance(tc.function.arguments, str)
+                    else tc.function.arguments
+                )
                 result = tool_executor(tc.function.name, args)
                 tokens = len(result) // 4
                 total_result_tokens += tokens
-                log.info("Tool call: %s(%s) → %d tokens (total: %d/%d)", tc.function.name, args, tokens, total_result_tokens, max_result_tokens)
-                conversation.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                log.info(
+                    "Tool call: %s(%s) → %d tokens (total: %d/%d)",
+                    tc.function.name,
+                    args,
+                    tokens,
+                    total_result_tokens,
+                    max_result_tokens,
+                )
+                conversation.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
                 if total_result_tokens >= max_result_tokens:
-                    log.warning("Tool result token budget exhausted (%d)", total_result_tokens)
+                    log.warning(
+                        "Tool result token budget exhausted (%d)", total_result_tokens
+                    )
                     return True
             return False
 
@@ -155,10 +180,12 @@ class LLMBackend:
 
         # Budget exhausted — explicitly tell the model to stop calling tools and answer
         log.warning("Tool rounds exhausted — sending explicit stop instruction")
-        conversation.append({
-            "role": "user",
-            "content": "Stop calling tools. You have enough context. Return ONLY the JSON decision object now, no tool calls.",
-        })
+        conversation.append(
+            {
+                "role": "user",
+                "content": "Stop calling tools. You have enough context. Return ONLY the JSON decision object now, no tool calls.",
+            }
+        )
         response = await self._client.chat.completions.create(
             messages=conversation, **_llm_kwargs()
         )
@@ -173,11 +200,16 @@ class LLMBackend:
         if cfg.model_path:
             cmd += ["--model", cfg.model_path]
         cmd += [
-            "--port",         str(cfg.port),
-            "--ctx-size",     str(cfg.ctx_size),
-            "--n-gpu-layers", str(cfg.n_gpu_layers),
-            "--threads",      str(cfg.threads),
-            "--temp",         str(cfg.temp),
+            "--port",
+            str(cfg.port),
+            "--ctx-size",
+            str(cfg.ctx_size),
+            "--n-gpu-layers",
+            str(cfg.n_gpu_layers),
+            "--threads",
+            str(cfg.threads),
+            "--temp",
+            str(cfg.temp),
         ]
         cmd.extend(cfg.extra_args)
         return cmd

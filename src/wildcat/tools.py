@@ -71,7 +71,11 @@ class MSInspectClient:
                 result = await session.call_tool(name, arguments)
                 # Extract text content and parse JSON
                 if result.content:
-                    text = result.content[0].text if hasattr(result.content[0], "text") else str(result.content[0])
+                    text = (
+                        result.content[0].text
+                        if hasattr(result.content[0], "text")
+                        else str(result.content[0])
+                    )
                     try:
                         return json.loads(text)
                     except (json.JSONDecodeError, TypeError):
@@ -82,7 +86,9 @@ class MSInspectClient:
         results: dict[str, dict] = {}
         for tool_name in tool_names:
             try:
-                results[tool_name] = await self.call_tool(tool_name, {"params": {"ms_path": ms_path}})
+                results[tool_name] = await self.call_tool(
+                    tool_name, {"params": {"ms_path": ms_path}}
+                )
             except Exception as exc:
                 log.warning("Tool %s failed: %s", tool_name, exc)
                 results[tool_name] = {"error": str(exc)}

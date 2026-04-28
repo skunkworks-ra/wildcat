@@ -26,7 +26,11 @@ from wildcat.tools import MSInspectClient
 log = logging.getLogger(__name__)
 
 # JSON schema that every LLM response must conform to
-_DECISION_SCHEMA_KEYS = {"next_stage", "summary", "reasoning"}  # casa_script is optional
+_DECISION_SCHEMA_KEYS = {
+    "next_stage",
+    "summary",
+    "reasoning",
+}  # casa_script is optional
 
 # ── Per-stage JSON instructions ─────────────────────────────────────────────
 
@@ -75,24 +79,55 @@ Choose CALIBRATION_PREFLAG for another rflag pass when data is still heavily con
 Maximum 3 CALIBRATION_PREFLAG passes — the orchestrator enforces this cap.
 """
 
-# CALIBRATION_APPLY: metrics summary + checkpoint questions only.
-# The CASA script is filled deterministically — LLM only interprets the results for the human.
+# CALIBRATION_APPLY: metrics summary + autonomous proceed decision.
+# The CASA script is filled deterministically — LLM interprets results and decides whether to
+# surface a human checkpoint or proceed directly to imaging.
 _JSON_INSTRUCTION_APPLY = """
 The CASA calibration script has already run. You are given the WILDCAT_METRICS output.
 Respond with a single JSON object and no other text. Schema:
 {
-  "summary": "<2-5 sentences summarising calibration quality using the actual metric values>",
+  "auto_proceed": <true if all fractions < 0.20 and n_antennas_lost <= 1, else false>,
+  "summary": "<2-5 sentences with actual metric values from WILDCAT_METRICS>",
   "checkpoint_questions": [
     {
       "id": "calibration_done",
-      "finding": "<one sentence with actual values: bp_flagged_frac=X, gain_flagged_frac=Y, post_cal_flag_frac=Z, n_antennas_lost=N>",
-      "severity": "<info|warning|critical>",
+      "finding": "<actual values + caltable paths from t_bp/t_gain/t_delay for operator inspection>",
+      "severity": "<warning|critical>",
       "question": "Calibration complete. Proceed to imaging or loop back for another calibration pass?",
-      "options": ["proceed", "loop_back", "exit"]
+      "options": ["proceed", "loop_back", "exit"],
+      "recommendation": "<proceed|loop_back>",
+      "timeout_seconds": <300 for warning, 600 for critical>,
+      "timeout_default": "proceed"
     }
   ]
 }
-Use the real metric values from WILDCAT_METRICS. Severity is info if all fractions < 0.20, warning if any 0.20-0.40, critical if any > 0.40.
+If auto_proceed is true, set checkpoint_questions to [].
+Severity: warning if any fraction 0.20-0.40 or n_antennas_lost 2-3; critical if any > 0.40 or n_antennas_lost > 3.
+recommendation: loop_back only if post_cal_flag_frac > 0.40 or n_antennas_lost > 3; otherwise proceed.
+"""
+
+# CALIBRATION_SOLVE: CASA ran deterministically; LLM inspects caltable quality and routes.
+# Valid next_stage: CALIBRATION_APPLY | CALIBRATION_PREFLAG | CALIBRATION_SOLVE (retry).
+_JSON_INSTRUCTION_SOLVE = """
+The CASA calibration script has already run. You are given:
+  - WILDCAT_METRICS: flag fractions and caltable paths from the solve job
+  - CALSOL_STATS: ms_calsol_stats output for delay.cal, bandpass.cal, gain.cal
+
+Respond with a single JSON object and no other text. Schema:
+{
+  "next_stage": "<CALIBRATION_APPLY | CALIBRATION_PREFLAG | CALIBRATION_SOLVE>",
+  "casa_script": "<modified solve script if next_stage == CALIBRATION_SOLVE, else null>",
+  "summary": "<2-4 sentences with actual metric values and quality assessment>",
+  "reasoning": "<brief trace explaining the routing decision>"
+}
+
+Rules:
+- CALIBRATION_APPLY: bp and gain flag fractions within band thresholds AND no hard quality failures.
+- CALIBRATION_PREFLAG: flag fractions exceed band thresholds — more RFI excision needed.
+- CALIBRATION_SOLVE (retry): flag fractions within threshold BUT quality failure detected
+  (phase_rms_deg > 30° on bandpass → re-run delay step; SNR < 3 → try alternate refant or combine=scan).
+  Provide a modified casa_script. Maximum 2 CALIBRATION_SOLVE retries — orchestrator enforces the cap.
+- If PREFLAG cap is already reached and thresholds are not met, choose CALIBRATION_APPLY anyway.
 """
 
 # POLCAL_SOLVE: full solve sequence K + G + B + setjy(polcal) + Kcross + Df + Xf
@@ -107,13 +142,14 @@ Respond with a single JSON object and no other text. Schema:
 }
 Always set next_stage to CALIBRATION_APPLY.
 Fill ALL {PLACEHOLDER} values from Phase 1-3 tool outputs.
-Choose POLTYPE_DTERM using guidance from 09-polcal-execution.md (Df vs Df+QU table).
+Choose POLTYPE_DTERM using guidance from wildcat/06-polcal.md (Df vs Df+QU table).
 POL_FREQ_LO and POL_FREQ_HI should bracket the usable PA nodes — for 3C48 at S-band use 2.0 and 9.0.
 """
 
 _JSON_INSTRUCTIONS_BY_STAGE: dict[Stage, str] = {
     Stage.CALIBRATION_PREFLAG: _JSON_INSTRUCTION_PREFLAG,
-    Stage.POLCAL_SOLVE:        _JSON_INSTRUCTION_POLCAL,
+    Stage.CALIBRATION_SOLVE: _JSON_INSTRUCTION_SOLVE,
+    Stage.POLCAL_SOLVE: _JSON_INSTRUCTION_POLCAL,
 }
 
 # ── Config mapping ────────────────────────────────────────────────────────────
@@ -123,16 +159,16 @@ _JSON_INSTRUCTIONS_BY_STAGE: dict[Stage, str] = {
 _QUESTION_CONFIG_MAP: dict[str, dict[str, tuple[str, object] | None]] = {
     "polcal": {
         "continue_polcal": ("polcal", True),
-        "stokes_i_only":   ("polcal", False),
-        "exit":            None,
-        "proceed":         ("polcal", True),   # LLM fallback
-        "loop_back":       ("polcal", False),  # LLM fallback
+        "stokes_i_only": ("polcal", False),
+        "exit": None,
+        "proceed": ("polcal", True),  # LLM fallback
+        "loop_back": ("polcal", False),  # LLM fallback
     },
     "aggressive_flagging": {
-        "yes":       ("aggressive_flagging", True),
-        "proceed":   ("aggressive_flagging", True),    # LLM fallback
-        "no":        ("aggressive_flagging", False),
-        "loop_back": ("aggressive_flagging", False),   # LLM fallback
+        "yes": ("aggressive_flagging", True),
+        "proceed": ("aggressive_flagging", True),  # LLM fallback
+        "no": ("aggressive_flagging", False),
+        "loop_back": ("aggressive_flagging", False),  # LLM fallback
     },
     # Calibration checkpoint — routing only, no config updates
     "calibration_done": {"proceed": None, "loop_back": None, "exit": None},
@@ -410,7 +446,7 @@ _TEMPLATE_POLCAL = """\
 # wildcat POLCAL_SOLVE — full solve: K + G + B + setjy(polcal) + Kcross + Df + Xf
 # Replaces CALIBRATION_SOLVE when polcal=True. CALIBRATION_APPLY follows.
 # LLM: fill all {PLACEHOLDER} values from Phase 1-3 tool outputs.
-# See 07-calibration-execution.md for K/G/B guidance, 09-polcal-execution.md for Df vs Df+QU.
+# See wildcat/05-solve.md for K/G/B guidance, wildcat/06-polcal.md for Df vs Df+QU.
 
 import json
 from casatools import ms as mstool
@@ -435,7 +471,7 @@ calibrator_name   = '{CALIBRATOR_NAME}'  # catalogue b1950 name (from ms_pol_cal
 reffreq_ghz       = {REFFREQ_GHZ}        # float — band_centre_ghz from ms_pol_cal_feasibility
 pol_freq_lo       = {POL_FREQ_LO}        # float — lower GHz bound for pol fit (e.g. 2.0 for S-band)
 pol_freq_hi       = {POL_FREQ_HI}        # float — upper GHz bound for pol fit (e.g. 9.0 for S-band)
-poltype_dterm     = '{POLTYPE_DTERM}'    # 'Df' or 'Df+QU' — see 09-polcal-execution.md
+poltype_dterm     = '{POLTYPE_DTERM}'    # 'Df' or 'Df+QU' — see wildcat/06-polcal.md
 
 workdir  = '/data/jobs/{WORKFLOW_ID}'
 t_delay  = workdir + '/delay.cal'
@@ -550,7 +586,7 @@ gaincal(
     parang=True,
 )
 
-# [DETERMINISTIC] D-term leakage (Df or Df+QU per 09-polcal-execution.md decision table)
+# [DETERMINISTIC] D-term leakage (Df or Df+QU per wildcat/06-polcal.md decision table)
 polcal(
     vis=vis, caltable=t_dterm,
     field=leakage_cal_field,
@@ -606,14 +642,25 @@ print('WILDCAT_METRICS: ' + json.dumps(metrics))
 
 _TEMPLATES_BY_STAGE: dict[Stage, str] = {
     Stage.CALIBRATION_PREFLAG: _TEMPLATE_PREFLAG,
-    Stage.POLCAL_SOLVE:        _TEMPLATE_POLCAL,
+    Stage.POLCAL_SOLVE: _TEMPLATE_POLCAL,
 }
 
 # Valid next_stage values per calibration stage (LLM-driven stages only)
 _VALID_CAL_NEXT_STAGES: dict[Stage, set[str]] = {
-    Stage.CALIBRATION_PREFLAG: {Stage.CALIBRATION_PREFLAG.value, Stage.CALIBRATION_SOLVE.value},
-    Stage.POLCAL_SOLVE:        {Stage.CALIBRATION_APPLY.value},
+    Stage.CALIBRATION_PREFLAG: {
+        Stage.CALIBRATION_PREFLAG.value,
+        Stage.CALIBRATION_SOLVE.value,
+    },
+    Stage.CALIBRATION_SOLVE: {
+        Stage.CALIBRATION_APPLY.value,
+        Stage.CALIBRATION_PREFLAG.value,
+        Stage.CALIBRATION_SOLVE.value,
+    },
+    Stage.POLCAL_SOLVE: {Stage.CALIBRATION_APPLY.value},
 }
+
+# Maximum solve retries before forcing CALIBRATION_APPLY regardless of quality
+_SOLVE_MAX_RETRIES = 2
 
 # Polcal feasibility verdicts that allow entering POLCAL_SOLVE
 _POLCAL_VIABLE_VERDICTS = {"FULL", "DEGRADED"}
@@ -632,11 +679,11 @@ _SPW_DISCARD_THRESHOLD = 0.80
 # Keyed by band letter derived from band_centre_ghz in ms_pol_cal_feasibility.
 # (bp_flagged_frac_max, gain_flagged_frac_max)
 _SOLVE_THRESHOLDS_BY_BAND: dict[str, tuple[float, float]] = {
-    "P":       (0.60, 0.60),  # 230–470 MHz — endemic RFI environment
-    "L":       (0.60, 0.60),  # 1–2 GHz
-    "S":       (0.40, 0.40),  # 2–4 GHz
-    "C":       (0.20, 0.15),  # 4–8 GHz
-    "X":       (0.20, 0.15),  # 8–12 GHz
+    "P": (0.60, 0.60),  # 230–470 MHz — endemic RFI environment
+    "L": (0.60, 0.60),  # 1–2 GHz
+    "S": (0.40, 0.40),  # 2–4 GHz
+    "C": (0.20, 0.15),  # 4–8 GHz
+    "X": (0.20, 0.15),  # 8–12 GHz
     "default": (0.40, 0.40),
 }
 
@@ -728,7 +775,11 @@ _INTERNAL_TOOLS_OPENAI = [
 ]
 
 # Stages that use the multi-turn tool-use pattern (others keep single-turn)
-_TOOL_USE_STAGES = {Stage.CALIBRATION_PREFLAG, Stage.POLCAL_SOLVE}
+_TOOL_USE_STAGES = {
+    Stage.CALIBRATION_PREFLAG,
+    Stage.CALIBRATION_SOLVE,
+    Stage.POLCAL_SOLVE,
+}
 
 
 class Orchestrator:
@@ -782,14 +833,12 @@ class Orchestrator:
                 elif stage == Stage.HUMAN_CHECKPOINT:
                     await self._handle_checkpoint(workflow_id)
 
-                elif stage == Stage.CALIBRATION_SOLVE:
-                    await self._handle_solve_stage(workflow_id)
-
                 elif stage == Stage.CALIBRATION_APPLY:
                     await self._handle_apply_stage(workflow_id)
 
                 elif stage in (
                     Stage.CALIBRATION_PREFLAG,
+                    Stage.CALIBRATION_SOLVE,
                     Stage.POLCAL_SOLVE,
                 ):
                     await self._handle_calibration_stage(workflow_id, stage)
@@ -800,12 +849,16 @@ class Orchestrator:
                 elif stage == Stage.CALIBRATION_LOOP:
                     wf_config = self.db.get_workflow_config(workflow_id)
                     wf_config["_preflag_iterations"] = 0
+                    wf_config["_solve_retries"] = 0
                     wf_config.pop("_preflag_flag_warning", None)
                     self.db.set_workflow_config(workflow_id, wf_config)
                     self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
 
                 elif stage == Stage.IMAGING_PIPELINE:
-                    log.info("Workflow %d reached IMAGING_PIPELINE — handoff complete", workflow_id)
+                    log.info(
+                        "Workflow %d reached IMAGING_PIPELINE — handoff complete",
+                        workflow_id,
+                    )
                     break
 
                 elif stage == Stage.STOPPED:
@@ -813,7 +866,10 @@ class Orchestrator:
                     break
 
                 elif stage == Stage.ERROR:
-                    log.error("Workflow %d is in ERROR state — manual intervention required", workflow_id)
+                    log.error(
+                        "Workflow %d is in ERROR state — manual intervention required",
+                        workflow_id,
+                    )
                     break
 
                 else:
@@ -831,7 +887,8 @@ class Orchestrator:
             except Exception:
                 log.exception(
                     "Unhandled error in stage %s for workflow %d — entering ERROR",
-                    stage, workflow_id,
+                    stage,
+                    workflow_id,
                 )
                 self.db.transition(workflow_id, Stage.ERROR)
                 break
@@ -851,13 +908,19 @@ class Orchestrator:
 
         # 1. Call MCP tools
         log.info("Running Phase %d tools on %s", phase, ms_path)
-        runner_map = {1: self.tools.run_phase1, 2: self.tools.run_phase2, 3: self.tools.run_phase3}
+        runner_map = {
+            1: self.tools.run_phase1,
+            2: self.tools.run_phase2,
+            3: self.tools.run_phase3,
+        }
         tool_outputs: dict[str, dict] = await runner_map[phase](ms_path)
 
         # 2. Persist tool outputs
         phase_label = f"phase{phase}"
         for tool_name, output in tool_outputs.items():
-            self.db.save_tool_output(workflow_id, phase_label, tool_name, json.dumps(output))
+            self.db.save_tool_output(
+                workflow_id, phase_label, tool_name, json.dumps(output)
+            )
 
         # 3. Assemble prompt
         system_prompt = load_system_prompt(self.skills_path, stage)
@@ -871,7 +934,7 @@ class Orchestrator:
         json_instruction = _JSON_INSTRUCTION_PHASE3 if phase == 3 else _JSON_INSTRUCTION
         messages = [
             {"role": "system", "content": system_prompt + "\n\n" + json_instruction},
-            {"role": "user",   "content": user_content},
+            {"role": "user", "content": user_content},
         ]
 
         if self.stop_event.is_set():
@@ -885,7 +948,9 @@ class Orchestrator:
 
         prompt_hash = hashlib.sha256(user_content.encode()).hexdigest()[:16]
         model = response.get("model", "unknown")
-        self.db.save_llm_decision(workflow_id, stage.value, json.dumps(decision), model, prompt_hash)
+        self.db.save_llm_decision(
+            workflow_id, stage.value, json.dumps(decision), model, prompt_hash
+        )
 
         if phase != 3 and decision.get("casa_script"):
             if self.stop_event.is_set():
@@ -900,7 +965,9 @@ class Orchestrator:
         try:
             next_stage = Stage(next_stage_str)
         except ValueError:
-            log.error("LLM returned unknown next_stage %r — entering ERROR", next_stage_str)
+            log.error(
+                "LLM returned unknown next_stage %r — entering ERROR", next_stage_str
+            )
             self.db.transition(workflow_id, Stage.ERROR)
             return
 
@@ -916,7 +983,9 @@ class Orchestrator:
             fallback = _phase_fallback[phase]
             log.warning(
                 "Workflow %d: LLM chose HUMAN_CHECKPOINT in Phase %d — overriding to %s",
-                workflow_id, phase, fallback.value,
+                workflow_id,
+                phase,
+                fallback.value,
             )
             next_stage = fallback
 
@@ -952,7 +1021,8 @@ class Orchestrator:
             overrides["polcal"] = False
             log.warning(
                 "Workflow %d: polcal=False — ms_pol_cal_feasibility verdict=%r",
-                workflow_id, verdict,
+                workflow_id,
+                verdict,
             )
 
         # Rule 2: any antenna fully flagged → enable aggressive flagging
@@ -962,7 +1032,8 @@ class Orchestrator:
             .get("per_antenna", [])
         )
         fully_flagged = [
-            a["antenna_name"] for a in per_antenna
+            a["antenna_name"]
+            for a in per_antenna
             if a.get("flag_fraction", {}).get("value", 0) >= 1.0
         ]
         if fully_flagged and not wf_config.get("aggressive_flagging", False):
@@ -970,21 +1041,27 @@ class Orchestrator:
             overrides["aggressive_flagging"] = True
             log.warning(
                 "Workflow %d: aggressive_flagging=True — antennas at 100%%: %s",
-                workflow_id, fully_flagged,
+                workflow_id,
+                fully_flagged,
             )
 
         if overrides:
             self.db.set_workflow_config(workflow_id, wf_config)
-            log.info("Workflow %d: deterministic config overrides applied: %s", workflow_id, overrides)
+            log.info(
+                "Workflow %d: deterministic config overrides applied: %s",
+                workflow_id,
+                overrides,
+            )
         return overrides
 
     # ── Calibration stage handler ──────────────────────────────────────────
 
     async def _handle_calibration_stage(self, workflow_id: int, stage: Stage) -> None:
-        """Read previous job metrics → LLM fills template → run CASA → transition.
+        """Calibration stage dispatcher.
 
-        Handles LLM-driven calibration stages: CALIBRATION_PREFLAG, POLCAL_SOLVE.
-        CALIBRATION_SOLVE and CALIBRATION_APPLY are handled by their own deterministic handlers.
+        CALIBRATION_SOLVE: run CASA deterministically first, then call ms_calsol_stats,
+          then LLM interprets quality and routes.
+        CALIBRATION_PREFLAG, POLCAL_SOLVE: LLM fills template, then CASA runs.
         """
         if self.stop_event.is_set():
             self.db.transition(workflow_id, Stage.STOPPED)
@@ -994,6 +1071,125 @@ class Orchestrator:
         wf_config = self.db.get_workflow_config(workflow_id)
         preflag_iterations = wf_config.get("_preflag_iterations", 0)
 
+        # ── CALIBRATION_SOLVE: run first, inspect, then LLM ───────────────
+        if stage == Stage.CALIBRATION_SOLVE:
+            solve_retries = wf_config.get("_solve_retries", 0)
+
+            # Enforce retry cap — force proceed after too many retries
+            if solve_retries >= _SOLVE_MAX_RETRIES:
+                log.warning(
+                    "Workflow %d: CALIBRATION_SOLVE retry cap (%d) reached — forcing CALIBRATION_APPLY",
+                    workflow_id,
+                    _SOLVE_MAX_RETRIES,
+                )
+                self.db.transition(workflow_id, Stage.CALIBRATION_APPLY)
+                return
+
+            # Build and run the deterministic solve script
+            script = self._build_solve_script(workflow_id)
+            await self._run_casa_job(workflow_id, Stage.CALIBRATION_SOLVE.value, script)
+            if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
+                return
+
+            # Call ms_calsol_stats on all three caltables in parallel
+            metrics = self.db.get_last_job_metrics(
+                workflow_id, Stage.CALIBRATION_SOLVE.value
+            )
+            t_delay = metrics.get("t_delay", "")
+            t_bp = metrics.get("t_bp", "")
+            t_gain = metrics.get("t_gain", "")
+            delay_stats, bp_stats, gain_stats = await asyncio.gather(
+                self._run_calsol_stats(t_delay),
+                self._run_calsol_stats(t_bp),
+                self._run_calsol_stats(t_gain),
+            )
+
+            band = self._get_band(workflow_id)
+            bp_max, gain_max = _SOLVE_THRESHOLDS_BY_BAND.get(
+                band, _SOLVE_THRESHOLDS_BY_BAND["default"]
+            )
+
+            instruction = _JSON_INSTRUCTION_SOLVE
+            system_prompt = load_system_prompt(self.skills_path, stage)
+            user_content = "\n".join(
+                [
+                    "## CALIBRATION_SOLVE — post-run inspection",
+                    f"Band: {band}  |  bp threshold: {bp_max}  |  gain threshold: {gain_max}",
+                    f"Preflag iterations: {preflag_iterations} / {_PREFLAG_MAX_ITERATIONS}",
+                    f"Solve retries so far: {solve_retries} / {_SOLVE_MAX_RETRIES}",
+                    "",
+                    "## WILDCAT_METRICS",
+                    "```json",
+                    json.dumps(metrics, indent=2),
+                    "```",
+                    "",
+                    "## CALSOL_STATS — delay.cal",
+                    "```json",
+                    json.dumps(delay_stats, indent=2),
+                    "```",
+                    "",
+                    "## CALSOL_STATS — bandpass.cal",
+                    "```json",
+                    json.dumps(bp_stats, indent=2),
+                    "```",
+                    "",
+                    "## CALSOL_STATS — gain.cal",
+                    "```json",
+                    json.dumps(gain_stats, indent=2),
+                    "```",
+                ]
+            )
+            messages = [
+                {"role": "system", "content": system_prompt + "\n\n" + instruction},
+                {"role": "user", "content": user_content},
+            ]
+
+            if self.stop_event.is_set():
+                self.db.transition(workflow_id, Stage.STOPPED)
+                return
+
+            decision, _model = await self._llm_call_with_retry_and_tools(
+                workflow_id, stage, messages
+            )
+            if decision is None:
+                return
+
+            next_stage_str = decision["next_stage"]
+            valid = _VALID_CAL_NEXT_STAGES[stage]
+            if next_stage_str not in valid:
+                log.error(
+                    "LLM returned illegal next_stage %r for CALIBRATION_SOLVE — entering ERROR",
+                    next_stage_str,
+                )
+                self.db.transition(workflow_id, Stage.ERROR)
+                return
+
+            # Track retries; run modified script if LLM wants a retry
+            if next_stage_str == Stage.CALIBRATION_SOLVE.value:
+                wf_config["_solve_retries"] = solve_retries + 1
+                self.db.set_workflow_config(workflow_id, wf_config)
+                if decision.get("casa_script"):
+                    await self._run_casa_job(
+                        workflow_id,
+                        Stage.CALIBRATION_SOLVE.value,
+                        decision["casa_script"],
+                    )
+                    if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
+                        return
+
+            # Polcal routing on CALIBRATION_APPLY path
+            if next_stage_str == Stage.CALIBRATION_APPLY.value and wf_config.get(
+                "polcal"
+            ):
+                polcal_verdict = self._get_polcal_verdict(workflow_id)
+                if polcal_verdict in _POLCAL_VIABLE_VERDICTS:
+                    next_stage_str = Stage.POLCAL_SOLVE.value
+
+            self.db.transition(workflow_id, Stage(next_stage_str))
+            return
+
+        # ── CALIBRATION_PREFLAG / POLCAL_SOLVE: LLM first, CASA second ────
+
         # Increment counter at entry so it counts all PREFLAG runs, regardless of
         # whether re-entry was driven by the LLM, the flag cap, or SOLVE threshold failure.
         if stage == Stage.CALIBRATION_PREFLAG:
@@ -1002,10 +1198,14 @@ class Orchestrator:
             self.db.set_workflow_config(workflow_id, wf_config)
 
         # Enforce preflag iteration cap
-        if stage == Stage.CALIBRATION_PREFLAG and preflag_iterations > _PREFLAG_MAX_ITERATIONS:
+        if (
+            stage == Stage.CALIBRATION_PREFLAG
+            and preflag_iterations > _PREFLAG_MAX_ITERATIONS
+        ):
             log.warning(
                 "CALIBRATION_PREFLAG hit cap (%d iterations) for workflow %d — escalating",
-                _PREFLAG_MAX_ITERATIONS, workflow_id,
+                _PREFLAG_MAX_ITERATIONS,
+                workflow_id,
             )
             wf_config["_preflag_flag_warning"] = True
             self.db.set_workflow_config(workflow_id, wf_config)
@@ -1031,7 +1231,9 @@ class Orchestrator:
             if stage == Stage.CALIBRATION_PREFLAG:
                 tmpl = self._prefill_preflag_template(workflow_id, tmpl)
             base_lines.append("\n## Script template")
-            base_lines.append("Complete the script by replacing ALL {PLACEHOLDER} values.")
+            base_lines.append(
+                "Complete the script by replacing ALL {PLACEHOLDER} values."
+            )
             base_lines.append("Do NOT modify sections marked [DETERMINISTIC].")
             base_lines.append(f"```python\n{tmpl}\n```")
 
@@ -1072,7 +1274,9 @@ class Orchestrator:
         if next_stage_str not in valid:
             log.error(
                 "LLM returned illegal next_stage %r for %s (valid: %s) — entering ERROR",
-                next_stage_str, stage, valid,
+                next_stage_str,
+                stage,
+                valid,
             )
             self.db.transition(workflow_id, Stage.ERROR)
             return
@@ -1087,30 +1291,42 @@ class Orchestrator:
                 return
 
         # 4b. Flag fraction cap
-        if stage == Stage.CALIBRATION_PREFLAG and next_stage_str == Stage.CALIBRATION_PREFLAG.value:
-            current_metrics = self.db.get_last_job_metrics(workflow_id, Stage.CALIBRATION_PREFLAG.value)
+        if (
+            stage == Stage.CALIBRATION_PREFLAG
+            and next_stage_str == Stage.CALIBRATION_PREFLAG.value
+        ):
+            current_metrics = self.db.get_last_job_metrics(
+                workflow_id, Stage.CALIBRATION_PREFLAG.value
+            )
             flag_frac = current_metrics.get("overall_flag_frac", 0.0)
             if isinstance(flag_frac, (int, float)) and flag_frac >= _PREFLAG_FLAG_CAP:
                 log.warning(
                     "Workflow %d: overall_flag_frac=%.3f >= cap %.2f — forcing CALIBRATION_SOLVE",
-                    workflow_id, flag_frac, _PREFLAG_FLAG_CAP,
+                    workflow_id,
+                    flag_frac,
+                    _PREFLAG_FLAG_CAP,
                 )
                 next_stage_str = Stage.CALIBRATION_SOLVE.value
 
         # 4c. Polcal routing
-        if stage == Stage.CALIBRATION_PREFLAG and next_stage_str == Stage.CALIBRATION_SOLVE.value:
+        if (
+            stage == Stage.CALIBRATION_PREFLAG
+            and next_stage_str == Stage.CALIBRATION_SOLVE.value
+        ):
             if wf_config.get("polcal"):
                 polcal_verdict = self._get_polcal_verdict(workflow_id)
                 if polcal_verdict in _POLCAL_VIABLE_VERDICTS:
                     log.info(
                         "Workflow %d: polcal=True, verdict=%s — routing to POLCAL_SOLVE",
-                        workflow_id, polcal_verdict,
+                        workflow_id,
+                        polcal_verdict,
                     )
                     next_stage_str = Stage.POLCAL_SOLVE.value
                 else:
                     log.info(
                         "Workflow %d: polcal=True but verdict=%r — using CALIBRATION_SOLVE",
-                        workflow_id, polcal_verdict,
+                        workflow_id,
+                        polcal_verdict,
                     )
 
         # 5. Transition
@@ -1118,12 +1334,18 @@ class Orchestrator:
 
     # ── Internal tool executor ─────────────────────────────────────────────
 
-    def _execute_internal_tool(self, workflow_id: int, tool_name: str, args: dict) -> str:
+    def _execute_internal_tool(
+        self, workflow_id: int, tool_name: str, args: dict
+    ) -> str:
         """Dispatch an internal tool call and return the result as a JSON string."""
         if tool_name == "get_metrics":
             stage_filter = args.get("stage")
             metrics = self.db.get_last_job_metrics(workflow_id, stage_filter)
-            return json.dumps(metrics, indent=2) if metrics else '{"error": "no metrics found"}'
+            return (
+                json.dumps(metrics, indent=2)
+                if metrics
+                else '{"error": "no metrics found"}'
+            )
 
         if tool_name == "get_previous_script":
             stage_filter = args.get("stage", "CALIBRATION_PREFLAG")
@@ -1193,7 +1415,10 @@ class Orchestrator:
                 if attempt > 1:
                     log.info(
                         "Workflow %d: LLM succeeded on attempt %d/%d for %s",
-                        workflow_id, attempt, self.max_retries, stage.value,
+                        workflow_id,
+                        attempt,
+                        self.max_retries,
+                        stage.value,
                     )
                 return decision, model
 
@@ -1201,17 +1426,25 @@ class Orchestrator:
                 last_error = str(exc)
                 log.warning(
                     "Workflow %d: LLM attempt %d/%d failed for %s — %s",
-                    workflow_id, attempt, self.max_retries, stage.value, last_error,
+                    workflow_id,
+                    attempt,
+                    self.max_retries,
+                    stage.value,
+                    last_error,
                 )
                 self.db.save_llm_decision(
-                    workflow_id, stage.value,
+                    workflow_id,
+                    stage.value,
                     json.dumps({"_retry_error": last_error, "_attempt": attempt}),
                     "retry",
                 )
 
         log.error(
             "Workflow %d: all %d LLM retries exhausted for %s — entering ERROR. Last: %s",
-            workflow_id, self.max_retries, stage.value, last_error,
+            workflow_id,
+            self.max_retries,
+            stage.value,
+            last_error,
         )
         self.db.transition(workflow_id, Stage.ERROR)
         return None, ""
@@ -1220,59 +1453,21 @@ class Orchestrator:
 
     # Maps the tool-output flux_standard identifier to the CASA-accepted string.
     _FLUX_STANDARD_MAP: dict[str, str] = {
-        "Perley-Butler-2017":     "Perley-Butler 2017",
-        "Perley-Butler-2013":     "Perley-Butler 2013",
-        "Scaife-Heald-2012":      "Scaife-Heald 2012",
-        "Stevens-Reynolds-2016":  "Stevens-Reynolds 2016",
+        "Perley-Butler-2017": "Perley-Butler 2017",
+        "Perley-Butler-2013": "Perley-Butler 2013",
+        "Scaife-Heald-2012": "Scaife-Heald 2012",
+        "Stevens-Reynolds-2016": "Stevens-Reynolds 2016",
     }
 
-    async def _handle_solve_stage(self, workflow_id: int) -> None:
-        """CALIBRATION_SOLVE: fill template deterministically, run CASA, apply threshold rule.
-
-        No LLM call. All placeholders are derived from Phase 1-3 tool outputs.
-        Threshold rule: bp/gain_flagged_frac < per-band thresholds → CALIBRATION_APPLY,
-        otherwise → CALIBRATION_PREFLAG for another flagging pass.
-        """
-        if self.stop_event.is_set():
-            self.db.transition(workflow_id, Stage.STOPPED)
-            return
-
-        script = self._build_solve_script(workflow_id)
-        await self._run_casa_job(workflow_id, Stage.CALIBRATION_SOLVE.value, script)
-        if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
-            return
-
-        metrics = self.db.get_last_job_metrics(workflow_id, Stage.CALIBRATION_SOLVE.value)
-        bp_frac   = float(metrics.get("bp_flagged_frac",   1.0))
-        gain_frac = float(metrics.get("gain_flagged_frac", 1.0))
-
-        band = self._get_band(workflow_id)
-        bp_max, gain_max = _SOLVE_THRESHOLDS_BY_BAND.get(band, _SOLVE_THRESHOLDS_BY_BAND["default"])
-        log.info("Workflow %d: band=%s thresholds bp<%.2f gain<%.2f (actual bp=%.3f gain=%.3f)",
-                 workflow_id, band, bp_max, gain_max, bp_frac, gain_frac)
-
-        if bp_frac < bp_max and gain_frac < gain_max:
-            log.info(
-                "Workflow %d: CALIBRATION_SOLVE passed (bp=%.3f gain=%.3f) → CALIBRATION_APPLY",
-                workflow_id, bp_frac, gain_frac,
+    async def _run_calsol_stats(self, caltable_path: str) -> dict:
+        """Call ms_calsol_stats via MCP on a single caltable. Returns {} on failure."""
+        try:
+            return await self.tools.call_tool(
+                "ms_calsol_stats", {"params": {"caltable_path": caltable_path}}
             )
-            self.db.transition(workflow_id, Stage.CALIBRATION_APPLY)
-        else:
-            wf_config = self.db.get_workflow_config(workflow_id)
-            preflag_iterations = wf_config.get("_preflag_iterations", 0)
-            if preflag_iterations >= _PREFLAG_MAX_ITERATIONS:
-                log.warning(
-                    "Workflow %d: CALIBRATION_SOLVE thresholds not met (bp=%.3f gain=%.3f) "
-                    "and PREFLAG cap reached (%d) — escalating to CALIBRATION_APPLY",
-                    workflow_id, bp_frac, gain_frac, preflag_iterations,
-                )
-                self.db.transition(workflow_id, Stage.CALIBRATION_APPLY)
-            else:
-                log.warning(
-                    "Workflow %d: CALIBRATION_SOLVE thresholds not met (bp=%.3f gain=%.3f) → CALIBRATION_PREFLAG",
-                    workflow_id, bp_frac, gain_frac,
-                )
-                self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
+        except Exception as exc:
+            log.warning("ms_calsol_stats failed for %s: %s", caltable_path, exc)
+            return {"error": str(exc)}
 
     def _prefill_preflag_template(self, workflow_id: int, tmpl: str) -> str:
         """Fill deterministic PREFLAG placeholders from stored tool outputs.
@@ -1284,26 +1479,29 @@ class Orchestrator:
 
         fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
         cal_ids = [
-            str(f["field_id"]) for f in fields
+            str(f["field_id"])
+            for f in fields
             if f.get("calibrator_role", {}).get("value")
             or f.get("calibrator_match", {}).get("value")
         ]
         cal_fields = ",".join(cal_ids) if cal_ids else "0"
 
-        n_spw = outputs.get("ms_spectral_window_list", {}).get("data", {}).get("n_spw", 16)
+        n_spw = (
+            outputs.get("ms_spectral_window_list", {}).get("data", {}).get("n_spw", 16)
+        )
         all_spw = f"0~{n_spw - 1}"
 
         corr_products = (
             outputs.get("ms_correlator_config", {})
-            .get("data", {}).get("corr_products", [])
+            .get("data", {})
+            .get("corr_products", [])
         )
         parallel = [c for c in corr_products if c in ("XX", "YY", "RR", "LL")]
         corrstring = ",".join(parallel) if parallel else "XX,YY"
 
         wf = self.db.get_workflow(workflow_id)
         return (
-            tmpl
-            .replace("{VIS}", wf["ms_path"])
+            tmpl.replace("{VIS}", wf["ms_path"])
             .replace("{CAL_FIELDS}", cal_fields)
             .replace("{ALL_SPW}", all_spw)
             .replace("{CORRSTRING}", corrstring)
@@ -1318,28 +1516,29 @@ class Orchestrator:
         phase_field_id = self._solve_phase_field_id(outputs, flux_field_id)
 
         n_spw = (
-            outputs.get("ms_spectral_window_list", {})
-            .get("data", {}).get("n_spw", 16)
+            outputs.get("ms_spectral_window_list", {}).get("data", {}).get("n_spw", 16)
         )
         all_spw = f"0~{n_spw - 1}"
 
         int_time_s = (
             outputs.get("ms_correlator_config", {})
-            .get("data", {}).get("dump_time_s", {}).get("value", 2.0)
+            .get("data", {})
+            .get("dump_time_s", {})
+            .get("value", 2.0)
         )
 
         subs = {
-            "{WORKFLOW_ID}":    str(workflow_id),
-            "{FLUX_FIELD}":     str(flux_field_id),
-            "{BP_FIELD}":       str(flux_field_id),
-            "{DELAY_FIELD}":    str(flux_field_id),
-            "{PHASE_FIELD}":    str(phase_field_id),
+            "{WORKFLOW_ID}": str(workflow_id),
+            "{FLUX_FIELD}": str(flux_field_id),
+            "{BP_FIELD}": str(flux_field_id),
+            "{DELAY_FIELD}": str(flux_field_id),
+            "{PHASE_FIELD}": str(phase_field_id),
             "{PHASE_SCAN_IDS}": self._solve_cal_scan_ids(outputs, str(phase_field_id)),
-            "{REFANT}":         self._solve_best_refant(outputs),
-            "{ALL_SPW}":        all_spw,
-            "{FLUX_STANDARD}":  self._solve_flux_standard(outputs, flux_field_id),
-            "{MINBLPERANT}":    "4",
-            "{INT_TIME_S}":     f"{float(int_time_s):.2f}",
+            "{REFANT}": self._solve_best_refant(outputs),
+            "{ALL_SPW}": all_spw,
+            "{FLUX_STANDARD}": self._solve_flux_standard(outputs, flux_field_id),
+            "{MINBLPERANT}": "4",
+            "{INT_TIME_S}": f"{float(int_time_s):.2f}",
         }
         script = _TEMPLATE_SOLVE
         for placeholder, value in subs.items():
@@ -1376,16 +1575,21 @@ class Orchestrator:
     def _solve_cal_scan_ids(self, outputs: dict, field_id: str) -> str:
         """Return comma-separated scan numbers on field_id from the scan list."""
         scans = outputs.get("ms_scan_list", {}).get("data", {}).get("scans", [])
-        ids = [str(s["scan_number"]) for s in scans if str(s.get("field_id")) == field_id]
+        ids = [
+            str(s["scan_number"]) for s in scans if str(s.get("field_id")) == field_id
+        ]
         return ",".join(ids) if ids else "1"
 
     def _solve_best_refant(self, outputs: dict) -> str:
         """Return the antenna with the lowest flag fraction (excluding 100% flagged)."""
         per_ant = (
             outputs.get("ms_antenna_flag_fraction", {})
-            .get("data", {}).get("per_antenna", [])
+            .get("data", {})
+            .get("per_antenna", [])
         )
-        valid = [a for a in per_ant if (a.get("flag_fraction", {}).get("value") or 1.0) < 1.0]
+        valid = [
+            a for a in per_ant if (a.get("flag_fraction", {}).get("value") or 1.0) < 1.0
+        ]
         if not valid:
             return "ea01"
         return min(valid, key=lambda a: a["flag_fraction"]["value"])["antenna_name"]
@@ -1415,8 +1619,12 @@ class Orchestrator:
             return
 
         # Read metrics from both stages for the LLM summary
-        apply_metrics = self.db.get_last_job_metrics(workflow_id, Stage.CALIBRATION_APPLY.value)
-        solve_metrics = self.db.get_last_job_metrics(workflow_id, Stage.CALIBRATION_SOLVE.value)
+        apply_metrics = self.db.get_last_job_metrics(
+            workflow_id, Stage.CALIBRATION_APPLY.value
+        )
+        solve_metrics = self.db.get_last_job_metrics(
+            workflow_id, Stage.CALIBRATION_SOLVE.value
+        )
 
         user_content = (
             "## CALIBRATION_SOLVE metrics\n```json\n"
@@ -1427,8 +1635,11 @@ class Orchestrator:
         )
         system_prompt = load_system_prompt(self.skills_path, Stage.CALIBRATION_APPLY)
         messages = [
-            {"role": "system", "content": system_prompt + "\n\n" + _JSON_INSTRUCTION_APPLY},
-            {"role": "user",   "content": user_content},
+            {
+                "role": "system",
+                "content": system_prompt + "\n\n" + _JSON_INSTRUCTION_APPLY,
+            },
+            {"role": "user", "content": user_content},
         ]
 
         decision, _model = await self._llm_call_with_retry_and_tools(
@@ -1437,7 +1648,14 @@ class Orchestrator:
         if decision is None:
             return
 
-        self.db.transition(workflow_id, Stage.CALIBRATION_CHECKPOINT)
+        if decision.get("auto_proceed"):
+            log.info(
+                "Workflow %d: auto_proceed=True — skipping checkpoint, advancing to IMAGING_PIPELINE",
+                workflow_id,
+            )
+            self.db.transition(workflow_id, Stage.IMAGING_PIPELINE)
+        else:
+            self.db.transition(workflow_id, Stage.CALIBRATION_CHECKPOINT)
 
     def _build_apply_script(self, workflow_id: int) -> str:
         """Fill all CALIBRATION_APPLY placeholders from Phase 1-3 tool outputs."""
@@ -1446,22 +1664,24 @@ class Orchestrator:
         # All calibrator field IDs — any field with a calibrator role or catalogue match
         fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
         cal_ids = [
-            str(f["field_id"]) for f in fields
+            str(f["field_id"])
+            for f in fields
             if f.get("calibrator_role", {}).get("value")
             or f.get("calibrator_match", {}).get("value")
         ]
         cal_fields = ",".join(cal_ids) if cal_ids else "0"
 
         n_spw = (
-            outputs.get("ms_spectral_window_list", {})
-            .get("data", {}).get("n_spw", 16)
+            outputs.get("ms_spectral_window_list", {}).get("data", {}).get("n_spw", 16)
         )
         all_spw = f"0~{n_spw - 1}"
 
         # Parallel hands only (e.g. XX,YY or RR,LL) for rflag on corrected data
         all_prods = (
             outputs.get("ms_correlator_config", {})
-            .get("data", {}).get("correlation_products", {}).get("value", ["XX", "YY"])
+            .get("data", {})
+            .get("correlation_products", {})
+            .get("value", ["XX", "YY"])
         )
         parallel = [p for p in all_prods if len(p) == 2 and p[0] == p[1]]
         corrstring = ",".join(parallel) if parallel else "XX,YY"
@@ -1469,7 +1689,7 @@ class Orchestrator:
         subs = {
             "{WORKFLOW_ID}": str(workflow_id),
             "{CAL_FIELDS}": cal_fields,
-            "{ALL_SPW}":    all_spw,
+            "{ALL_SPW}": all_spw,
             "{CORRSTRING}": corrstring,
         }
         script = _TEMPLATE_APPLY
@@ -1488,43 +1708,68 @@ class Orchestrator:
         wf = self.db.get_workflow(workflow_id)
         current_stage = Stage(wf["stage"])
 
-        last_decision = self.db.conn.execute(
+        last_decision_row = self.db.conn.execute(
             "SELECT decision FROM llm_decisions WHERE workflow_id = ?"
             " ORDER BY decided_at DESC LIMIT 1",
             (workflow_id,),
         ).fetchone()
-        if last_decision:
-            llm_summary = json.loads(last_decision["decision"]).get("summary", "No summary available.")
-        else:
-            llm_summary = "No summary available."
+        last_llm = (
+            json.loads(last_decision_row["decision"]) if last_decision_row else {}
+        )
+        llm_summary = last_llm.get("summary", "No summary available.")
 
-        checkpoint_id = self.db.create_checkpoint(workflow_id, current_stage.value, llm_summary)
+        checkpoint_id = self.db.create_checkpoint(
+            workflow_id, current_stage.value, llm_summary
+        )
         log.info(
             "Checkpoint %d (%s) created for workflow %d — awaiting human decision",
-            checkpoint_id, current_stage.value, workflow_id,
+            checkpoint_id,
+            current_stage.value,
+            workflow_id,
         )
 
+        # Timeout config from LLM decision (CALIBRATION_APPLY sets these per checkpoint_questions).
+        questions = last_llm.get("checkpoint_questions") or []
+        first_q = questions[0] if questions else {}
+        timeout_seconds = first_q.get("timeout_seconds", 300)
+        timeout_default = first_q.get("timeout_default", Stage.IMAGING_PIPELINE.value)
+
         self.checkpoint_event.clear()
-        await self.checkpoint_event.wait()
+        try:
+            await asyncio.wait_for(
+                self.checkpoint_event.wait(), timeout=float(timeout_seconds)
+            )
+        except asyncio.TimeoutError:
+            log.info(
+                "Checkpoint %d timed out after %ss — using default route %r",
+                checkpoint_id,
+                timeout_seconds,
+                timeout_default,
+            )
+            self.db.resolve_checkpoint(checkpoint_id, timeout_default, "timeout")
 
         checkpoint = self.db.get_latest_checkpoint(workflow_id)
-        human_route = (checkpoint or {}).get("human_route", Stage.IMAGING_PIPELINE.value)
+        human_route = (checkpoint or {}).get(
+            "human_route", Stage.IMAGING_PIPELINE.value
+        )
 
         route_map = {
-            Stage.STOPPED.value:               Stage.STOPPED,
-            Stage.CALIBRATION_LOOP.value:      Stage.CALIBRATION_LOOP,
-            Stage.CALIBRATION_PREFLAG.value:   Stage.CALIBRATION_PREFLAG,
-            Stage.IMAGING_PIPELINE.value:      Stage.IMAGING_PIPELINE,
+            Stage.STOPPED.value: Stage.STOPPED,
+            Stage.CALIBRATION_LOOP.value: Stage.CALIBRATION_LOOP,
+            Stage.CALIBRATION_PREFLAG.value: Stage.CALIBRATION_PREFLAG,
+            Stage.IMAGING_PIPELINE.value: Stage.IMAGING_PIPELINE,
             # Legacy
             "calibration": Stage.CALIBRATION_LOOP,
-            "imaging":     Stage.IMAGING_PIPELINE,
+            "imaging": Stage.IMAGING_PIPELINE,
         }
         next_stage = route_map.get(human_route, Stage.IMAGING_PIPELINE)
         self.db.transition(workflow_id, next_stage)
 
     # ── CASA job helper ────────────────────────────────────────────────────
 
-    async def _run_casa_job(self, workflow_id: int, stage_label: str, script_content: str) -> None:
+    async def _run_casa_job(
+        self, workflow_id: int, stage_label: str, script_content: str
+    ) -> None:
         """Write script to disk, submit to runner, await completion.
 
         Transitions to ERROR if the job fails — callers should check for ERROR
@@ -1544,7 +1789,10 @@ class Orchestrator:
         if job and job["status"] == "failed":
             log.error(
                 "Job %d (%s) failed — transitioning workflow %d to ERROR\n%s",
-                job_id, stage_label, workflow_id, job["stderr"] or "",
+                job_id,
+                stage_label,
+                workflow_id,
+                job["stderr"] or "",
             )
             self.db.transition(workflow_id, Stage.ERROR)
 
@@ -1631,12 +1879,14 @@ class Orchestrator:
         text = raw.strip()
         if text.startswith("```"):
             lines = text.splitlines()
-            text = "\n".join(l for l in lines if not l.strip().startswith("```"))
+            text = "\n".join(ln for ln in lines if not ln.strip().startswith("```"))
 
         try:
             decision = json.loads(text)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"LLM response is not valid JSON: {exc}\n---\n{raw}") from exc
+            raise ValueError(
+                f"LLM response is not valid JSON: {exc}\n---\n{raw}"
+            ) from exc
 
         missing = _DECISION_SCHEMA_KEYS - decision.keys()
         if missing:
@@ -1649,7 +1899,9 @@ class Orchestrator:
         try:
             return response["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as exc:
-            raise ValueError(f"Unexpected LLM response shape: {exc}\n{response}") from exc
+            raise ValueError(
+                f"Unexpected LLM response shape: {exc}\n{response}"
+            ) from exc
 
     def _format_tool_outputs(self, outputs: dict[str, dict], phase: int) -> str:
         """Format MCP tool outputs into a structured prompt string."""

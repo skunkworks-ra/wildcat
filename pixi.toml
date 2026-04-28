@@ -9,6 +9,9 @@ pip = ">=24"
 
 [pypi-dependencies]
 wildcat = { path = ".", editable = true }
+pytest = ">=8.0"
+pytest-asyncio = ">=0.23"
+ruff = ">=0.6"
 
 [tasks]
 start = { cmd = "wildcat", description = "Start all wildcat services" }

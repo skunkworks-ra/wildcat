@@ -26,33 +26,33 @@ _ALWAYS = [
 
 # Additional partials by stage group
 _STAGE_EXTRAS: dict[str, list[str]] = {
-    "phase1":              ["wildcat/01-phase1.md"],
-    "phase2":              ["wildcat/02-phase2.md"],
-    "phase3":              ["wildcat/03-phase3.md"],
-    "checkpoint":          ["wildcat/03-phase3.md", "wildcat/08-failure.md"],
+    "phase1": ["wildcat/01-phase1.md"],
+    "phase2": ["wildcat/02-phase2.md"],
+    "phase3": ["wildcat/03-phase3.md"],
+    "checkpoint": ["wildcat/03-phase3.md", "wildcat/08-failure.md"],
     "calibration_preflag": ["wildcat/04-preflag.md"],
-    "calibration_solve":   ["wildcat/05-solve.md"],
-    "calibration_apply":   ["wildcat/07-apply.md"],
-    "polcal":              ["wildcat/06-polcal.md"],
-    "calibration_loop":    ["wildcat/08-failure.md"],
+    "calibration_solve": ["wildcat/05-solve.md"],
+    "calibration_apply": ["wildcat/07-apply.md"],
+    "polcal": ["wildcat/06-polcal.md"],
+    "calibration_loop": ["wildcat/08-failure.md"],
 }
 
 # Map Stage enum values to stage groups
 _STAGE_TO_GROUP: dict[Stage, str] = {
-    Stage.PHASE1_RUNNING:         "phase1",
-    Stage.PHASE1_COMPLETE:        "phase1",
-    Stage.PHASE2_RUNNING:         "phase2",
-    Stage.PHASE2_COMPLETE:        "phase2",
-    Stage.PHASE3_RUNNING:         "phase3",
-    Stage.PHASE3_COMPLETE:        "phase3",
-    Stage.HUMAN_CHECKPOINT:       "checkpoint",
-    Stage.IMAGING_PIPELINE:       "checkpoint",
-    Stage.CALIBRATION_PREFLAG:    "calibration_preflag",
-    Stage.CALIBRATION_SOLVE:      "calibration_solve",
-    Stage.CALIBRATION_APPLY:      "calibration_apply",
-    Stage.POLCAL_SOLVE:           "polcal",
+    Stage.PHASE1_RUNNING: "phase1",
+    Stage.PHASE1_COMPLETE: "phase1",
+    Stage.PHASE2_RUNNING: "phase2",
+    Stage.PHASE2_COMPLETE: "phase2",
+    Stage.PHASE3_RUNNING: "phase3",
+    Stage.PHASE3_COMPLETE: "phase3",
+    Stage.HUMAN_CHECKPOINT: "checkpoint",
+    Stage.IMAGING_PIPELINE: "checkpoint",
+    Stage.CALIBRATION_PREFLAG: "calibration_preflag",
+    Stage.CALIBRATION_SOLVE: "calibration_solve",
+    Stage.CALIBRATION_APPLY: "calibration_apply",
+    Stage.POLCAL_SOLVE: "polcal",
     Stage.CALIBRATION_CHECKPOINT: "calibration_apply",
-    Stage.CALIBRATION_LOOP:       "calibration_loop",
+    Stage.CALIBRATION_LOOP: "calibration_loop",
 }
 
 

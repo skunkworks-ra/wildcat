@@ -9,29 +9,28 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
 from enum import Enum
 from typing import Any
 
 
 class Stage(str, Enum):
-    IDLE                    = "IDLE"
-    PHASE1_RUNNING          = "PHASE1_RUNNING"
-    PHASE1_COMPLETE         = "PHASE1_COMPLETE"
-    PHASE2_RUNNING          = "PHASE2_RUNNING"
-    PHASE2_COMPLETE         = "PHASE2_COMPLETE"
-    PHASE3_RUNNING          = "PHASE3_RUNNING"
-    PHASE3_COMPLETE         = "PHASE3_COMPLETE"
-    HUMAN_CHECKPOINT        = "HUMAN_CHECKPOINT"
-    CALIBRATION_PREFLAG     = "CALIBRATION_PREFLAG"
-    CALIBRATION_SOLVE       = "CALIBRATION_SOLVE"
-    CALIBRATION_APPLY       = "CALIBRATION_APPLY"
-    POLCAL_SOLVE            = "POLCAL_SOLVE"
-    CALIBRATION_CHECKPOINT  = "CALIBRATION_CHECKPOINT"
-    CALIBRATION_LOOP        = "CALIBRATION_LOOP"
-    IMAGING_PIPELINE        = "IMAGING_PIPELINE"
-    STOPPED                 = "STOPPED"
-    ERROR                   = "ERROR"
+    IDLE = "IDLE"
+    PHASE1_RUNNING = "PHASE1_RUNNING"
+    PHASE1_COMPLETE = "PHASE1_COMPLETE"
+    PHASE2_RUNNING = "PHASE2_RUNNING"
+    PHASE2_COMPLETE = "PHASE2_COMPLETE"
+    PHASE3_RUNNING = "PHASE3_RUNNING"
+    PHASE3_COMPLETE = "PHASE3_COMPLETE"
+    HUMAN_CHECKPOINT = "HUMAN_CHECKPOINT"
+    CALIBRATION_PREFLAG = "CALIBRATION_PREFLAG"
+    CALIBRATION_SOLVE = "CALIBRATION_SOLVE"
+    CALIBRATION_APPLY = "CALIBRATION_APPLY"
+    POLCAL_SOLVE = "POLCAL_SOLVE"
+    CALIBRATION_CHECKPOINT = "CALIBRATION_CHECKPOINT"
+    CALIBRATION_LOOP = "CALIBRATION_LOOP"
+    IMAGING_PIPELINE = "IMAGING_PIPELINE"
+    STOPPED = "STOPPED"
+    ERROR = "ERROR"
 
 
 _WORKFLOW_CONFIG_DEFAULT = '{"polcal": true, "aggressive_flagging": false}'
@@ -243,9 +242,7 @@ class StateDB:
         )
         self.conn.commit()
 
-    def get_last_job_metrics(
-        self, workflow_id: int, stage: str | None = None
-    ) -> dict:
+    def get_last_job_metrics(self, workflow_id: int, stage: str | None = None) -> dict:
         """Return parsed metrics from the most recent completed job.
 
         When stage is given, only jobs for that stage are considered.
@@ -275,16 +272,14 @@ class StateDB:
             for line in row["stdout"].splitlines():
                 if line.startswith("WILDCAT_METRICS:"):
                     try:
-                        return json.loads(line[len("WILDCAT_METRICS:"):].strip())
+                        return json.loads(line[len("WILDCAT_METRICS:") :].strip())
                     except json.JSONDecodeError:
                         pass
         return {}
 
     # ── Checkpoints ───────────────────────────────────────────────────────
 
-    def create_checkpoint(
-        self, workflow_id: int, stage: str, llm_summary: str
-    ) -> int:
+    def create_checkpoint(self, workflow_id: int, stage: str, llm_summary: str) -> int:
         cur = self.conn.execute(
             "INSERT INTO checkpoints (workflow_id, stage, llm_summary) VALUES (?, ?, ?)",
             (workflow_id, stage, llm_summary),

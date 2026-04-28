@@ -51,7 +51,9 @@ class CASARunner:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            async def drain_stream(stream: asyncio.StreamReader, buf: list[str]) -> None:
+            async def drain_stream(
+                stream: asyncio.StreamReader, buf: list[str]
+            ) -> None:
                 async for raw_line in stream:
                     line = raw_line.decode(errors="replace").rstrip()
                     buf.append(line)
@@ -83,7 +85,7 @@ class CASARunner:
             for line in stdout_lines:
                 if line.startswith("WILDCAT_METRICS:"):
                     try:
-                        metrics = json.loads(line[len("WILDCAT_METRICS:"):].strip())
+                        metrics = json.loads(line[len("WILDCAT_METRICS:") :].strip())
                         self.db.update_job_metrics(job_id, json.dumps(metrics))
                     except json.JSONDecodeError:
                         log.warning("Job %d: malformed WILDCAT_METRICS line", job_id)

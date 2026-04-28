@@ -16,7 +16,7 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, FastAPI, Form, HTTPException
+from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -81,7 +81,7 @@ def build_ui_app(
             request,
             "start.html",
             {
-                "ms_path":         ms_path or "unknown",
+                "ms_path": ms_path or "unknown",
                 "next_workflow_id": next_id,
                 "already_started": already_started,
             },
@@ -100,9 +100,9 @@ def build_ui_app(
             request,
             "start.html",
             {
-                "ms_path":          ms_path or "unknown",
+                "ms_path": ms_path or "unknown",
                 "next_workflow_id": next_id,
-                "already_started":  True,
+                "already_started": True,
             },
         )
 
@@ -112,7 +112,9 @@ def build_ui_app(
         try:
             wf = db.get_workflow(workflow_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
+            raise HTTPException(
+                status_code=404, detail=f"Workflow {workflow_id} not found"
+            )
 
         checkpoint = db.get_latest_checkpoint(workflow_id)
         if checkpoint is None:
@@ -160,11 +162,11 @@ def build_ui_app(
             request,
             "checkpoint.html",
             {
-                "workflow":             wf,
-                "checkpoint":           checkpoint,
-                "tool_outputs":         tool_outputs,
+                "workflow": wf,
+                "checkpoint": checkpoint,
+                "tool_outputs": tool_outputs,
                 "checkpoint_questions": checkpoint_questions,
-                "plots":                plots,
+                "plots": plots,
             },
         )
 
@@ -209,7 +211,9 @@ def build_ui_app(
             ).fetchone()
             if row:
                 try:
-                    checkpoint_questions = json.loads(row["decision"]).get("checkpoint_questions") or []
+                    checkpoint_questions = (
+                        json.loads(row["decision"]).get("checkpoint_questions") or []
+                    )
                 except (json.JSONDecodeError, KeyError):
                     pass
 
@@ -219,10 +223,10 @@ def build_ui_app(
             request,
             "checkpoint_panel.html",
             {
-                "workflow_id":          workflow_id,
-                "checkpoint":           checkpoint,
+                "workflow_id": workflow_id,
+                "checkpoint": checkpoint,
                 "checkpoint_questions": checkpoint_questions,
-                "already_decided":      already_decided,
+                "already_decided": already_decided,
             },
         )
 
@@ -246,7 +250,7 @@ def build_ui_app(
 
         # Collect answers: {"polcal": "proceed", "aggressive_flagging": "yes", ...}
         answers: dict[str, str] = {
-            key[len("answer_"):]: str(value)
+            key[len("answer_") :]: str(value)
             for key, value in form.items()
             if key.startswith("answer_")
         }
@@ -288,7 +292,10 @@ def build_ui_app(
         )
         log.info(
             "Checkpoint %d resolved: route=%s answers=%s workflow=%d",
-            checkpoint["id"], route, answers, workflow_id,
+            checkpoint["id"],
+            route,
+            answers,
+            workflow_id,
         )
 
         # Unblock the orchestrator
@@ -307,7 +314,9 @@ def build_ui_app(
         try:
             wf = db.get_workflow(workflow_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
+            raise HTTPException(
+                status_code=404, detail=f"Workflow {workflow_id} not found"
+            )
         return templates.TemplateResponse(
             request,
             "pipeline.html",
@@ -331,8 +340,16 @@ def build_ui_app(
                     parsed = json.loads(row["output_json"])
                 except json.JSONDecodeError:
                     parsed = {"raw": row.get("output_json", "")}
-                tools_parsed.append({"name": row["tool_name"], "output": parsed, "collected_at": row["collected_at"]})
-            phase_data.append({"phase": phase_num, "label": phase_label, "tools": tools_parsed})
+                tools_parsed.append(
+                    {
+                        "name": row["tool_name"],
+                        "output": parsed,
+                        "collected_at": row["collected_at"],
+                    }
+                )
+            phase_data.append(
+                {"phase": phase_num, "label": phase_label, "tools": tools_parsed}
+            )
 
         llm_decisions = db.conn.execute(
             "SELECT stage, decision, model, decided_at FROM llm_decisions"
@@ -345,12 +362,14 @@ def build_ui_app(
                 dec = json.loads(row["decision"])
             except json.JSONDecodeError:
                 dec = {"raw": row["decision"]}
-            decisions_parsed.append({
-                "stage": row["stage"],
-                "model": row["model"],
-                "decided_at": row["decided_at"],
-                "decision": dec,
-            })
+            decisions_parsed.append(
+                {
+                    "stage": row["stage"],
+                    "model": row["model"],
+                    "decided_at": row["decided_at"],
+                    "decision": dec,
+                }
+            )
 
         jobs = db.conn.execute(
             "SELECT stage, script_path, status, stdout, stderr, plots, queued_at, completed_at"
@@ -376,7 +395,9 @@ def build_ui_app(
         try:
             wf = db.get_workflow(workflow_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail=f"Workflow {workflow_id} not found")
+            raise HTTPException(
+                status_code=404, detail=f"Workflow {workflow_id} not found"
+            )
 
         terminal = {"STOPPED", "IMAGING_PIPELINE", "CALIBRATION_LOOP", "ERROR"}
         if wf["stage"] in terminal:

@@ -15,12 +15,11 @@ import json
 import os
 
 import pytest
-import pytest_asyncio
 
 from wildcat.tools import MSInspectClient
 
 MS_INSPECT_URL = os.environ.get("MS_INSPECT_URL", "http://localhost:8000")
-TEST_MS_PATH   = os.environ.get("TEST_MS_PATH", "/data/test.ms")
+TEST_MS_PATH = os.environ.get("TEST_MS_PATH", "/data/test.ms")
 
 
 @pytest.mark.asyncio
@@ -49,7 +48,9 @@ async def test_list_tools_returns_schemas():
 async def test_ms_observation_info_returns_dict():
     """Call ms_observation_info and verify the response is a dict with content."""
     async with MSInspectClient(MS_INSPECT_URL) as client:
-        result = await client.call_tool("ms_observation_info", {"ms_path": TEST_MS_PATH})
+        result = await client.call_tool(
+            "ms_observation_info", {"ms_path": TEST_MS_PATH}
+        )
 
     assert isinstance(result, dict), "call_tool should return a dict"
     assert result, "result should not be empty"
