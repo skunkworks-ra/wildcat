@@ -24,7 +24,7 @@ from wildcat.config import LLMConfig
 
 log = logging.getLogger(__name__)
 
-_HEALTH_TIMEOUT = 60  # seconds to wait for llama-server /health
+_HEALTH_TIMEOUT = 180  # seconds to wait for llama-server /health
 _HEALTH_POLL = 1.0  # poll interval in seconds
 
 
