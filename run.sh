@@ -45,7 +45,43 @@ echo "  ms-inspect: $MS_INSPECT_SRC"
 echo "  model:      $MODEL_PATH"
 echo "  output:     $OUTPUT_DIR"
 
-# ── Step 2: Start container ───────────────────────────────────────────────────
+# ── Step 2: Detect GPU environment ───────────────────────────────────────────
+step "Detecting GPU environment"
+
+GPU_ARGS=()
+GPU_ENV=()
+
+if [ -e /dev/dxg ]; then
+    # WSL2 — DXG device + host CUDA libs injected via bind mount
+    echo "  GPU mode: WSL2 (DXG)"
+    GPU_ARGS+=(--device /dev/dxg)
+    GPU_ARGS+=(-v /usr/lib/wsl:/usr/lib/wsl:ro)
+    GPU_ENV+=(-e LD_LIBRARY_PATH=/usr/lib/wsl/lib)
+elif [ -f /etc/cdi/nvidia.yaml ]; then
+    # Native Linux — CDI spec present
+    echo "  GPU mode: native Linux CDI"
+    GPU_ARGS+=(--device nvidia.com/gpu=all)
+elif nvidia-smi &>/dev/null; then
+    # Native Linux — no CDI yet, generate it
+    echo "  GPU mode: native Linux (generating CDI spec)"
+    mkdir -p /etc/cdi
+    nvidia-ctk cdi generate --output /etc/cdi/nvidia.yaml 2>/dev/null \
+        || warn "nvidia-ctk not found — trying --gpus all fallback"
+    if [ -f /etc/cdi/nvidia.yaml ]; then
+        GPU_ARGS+=(--device nvidia.com/gpu=all)
+    else
+        GPU_ARGS+=(--device nvidia.com/gpu=all)
+        warn "CDI generation failed — container may not see GPU"
+    fi
+else
+    # No GPU detected — CPU only
+    warn "No GPU detected — running CPU only (slow)"
+    GPU_ENV+=(-e WILDCAT_N_GPU_LAYERS=0)
+fi
+
+echo "  GPU args: ${GPU_ARGS[*]:-none}"
+
+# ── Step 3: Start container ───────────────────────────────────────────────────
 step "Starting container"
 
 # Clean up any previous run
@@ -55,9 +91,8 @@ MODEL_MOUNT_ARGS=(-v "$MODEL_PATH":/models/model.gguf:ro)
 
 podman run -d \
     --name wildcat-test \
-    --device /dev/dxg \
-    -v /usr/lib/wsl:/usr/lib/wsl:ro \
-    -e LD_LIBRARY_PATH=/usr/lib/wsl/lib \
+    "${GPU_ARGS[@]+"${GPU_ARGS[@]}"}" \
+    "${GPU_ENV[@]+"${GPU_ENV[@]}"}" \
     -e WILDCAT_MS_PATH="$CONTAINER_MS" \
     -e WILDCAT_AUTOSTART=1 \
     -v "$MS_INSPECT_SRC":/opt/ms-inspect:ro \
@@ -70,7 +105,7 @@ podman run -d \
 
 echo "  Container started: wildcat-test"
 
-# ── Step 3: Wait for ms-inspect ───────────────────────────────────────────────
+# ── Step 4: Wait for ms-inspect ───────────────────────────────────────────────
 step "Waiting for ms-inspect to be ready on :$PORT_MS_INSPECT"
 
 for i in $(seq 1 60); do
