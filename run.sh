@@ -62,17 +62,11 @@ elif [ -f /etc/cdi/nvidia.yaml ]; then
     echo "  GPU mode: native Linux CDI"
     GPU_ARGS+=(--device nvidia.com/gpu=all)
 elif nvidia-smi &>/dev/null; then
-    # Native Linux — no CDI yet, generate it
-    echo "  GPU mode: native Linux (generating CDI spec)"
-    mkdir -p /etc/cdi
-    nvidia-ctk cdi generate --output /etc/cdi/nvidia.yaml 2>/dev/null \
-        || warn "nvidia-ctk not found — trying --gpus all fallback"
-    if [ -f /etc/cdi/nvidia.yaml ]; then
-        GPU_ARGS+=(--device nvidia.com/gpu=all)
-    else
-        GPU_ARGS+=(--device nvidia.com/gpu=all)
-        warn "CDI generation failed — container may not see GPU"
-    fi
+    # Native Linux — pass NVIDIA devices directly (works on Atomic OS without nvidia-ctk)
+    echo "  GPU mode: native Linux (direct device passthrough)"
+    for dev in /dev/nvidia* /dev/nvidia-caps/nvidia-cap*; do
+        [ -e "$dev" ] && GPU_ARGS+=(--device "$dev")
+    done
 else
     # No GPU detected — CPU only
     warn "No GPU detected — running CPU only (slow)"
