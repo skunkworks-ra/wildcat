@@ -1312,16 +1312,19 @@ class Orchestrator:
 
         # Always include the template (LLM needs it to produce the script)
         template = _TEMPLATES_BY_STAGE.get(stage)
+        tmpl: str | None = None
         if template:
             tmpl = template.replace("{WORKFLOW_ID}", str(workflow_id))
-            # Pre-fill deterministic placeholders so the LLM can't misidentify fields/SPWs
+            # Pre-fill ALL deterministic placeholders before showing to the LLM.
+            # After this call the script is complete and runnable — no blanks remain.
             if stage == Stage.CALIBRATION_PREFLAG:
                 tmpl = self._prefill_preflag_template(workflow_id, tmpl)
-            base_lines.append("\n## Script template")
+            base_lines.append("\n## CASA script")
             base_lines.append(
-                "Complete the script by replacing ALL {PLACEHOLDER} values."
+                "All values are already filled. Copy this script verbatim into "
+                "the casa_script field of your JSON response. "
+                "Do NOT modify sections marked [DETERMINISTIC]."
             )
-            base_lines.append("Do NOT modify sections marked [DETERMINISTIC].")
             base_lines.append(f"```python\n{tmpl}\n```")
 
         if is_reentry:
@@ -1332,9 +1335,8 @@ class Orchestrator:
             )
         else:
             base_lines.append(
-                "\nUse the tools to retrieve Phase 1-3 tool outputs (ms_field_list, "
-                "ms_spectral_window_list, ms_correlator_config) and the workflow config, "
-                "then fill the template and return your decision."
+                "\nReview the script above, then return your decision. "
+                "Use the tools if you need to inspect Phase 1-3 outputs or workflow config."
             )
 
         user_content = "\n".join(base_lines)
@@ -1373,7 +1375,30 @@ class Orchestrator:
             if self.stop_event.is_set():
                 self.db.transition(workflow_id, Stage.STOPPED)
                 return
-            await self._run_casa_job(workflow_id, stage.value, decision["casa_script"])
+            script = decision["casa_script"]
+            # Safety net: if the LLM rewrote the script using placeholder names instead
+            # of copying the pre-filled template, apply the same substitution.
+            if stage == Stage.CALIBRATION_PREFLAG and tmpl is not None:
+                script = self._prefill_preflag_template(workflow_id, script)
+            # Hard-fail if any {PLACEHOLDER} patterns remain — do not pass to CASA.
+            import re as _re
+            remaining = _re.findall(r"\{[A-Z_a-z]+\}", script)
+            # Exclude Python dict/set literals: single-word tokens that look like
+            # variable names rather than template placeholders are fine, but we
+            # specifically check for the known placeholder names.
+            _KNOWN_PLACEHOLDERS = {
+                "{CAL_FIELDS}", "{cal_fields}", "{ALL_SPW}", "{all_spw}",
+                "{CORRSTRING}", "{corrstring}", "{VIS}", "{WORKFLOW_ID}",
+                "{SPW_DISCARD_THRESHOLD}",
+            }
+            bad = [p for p in remaining if p in _KNOWN_PLACEHOLDERS]
+            if bad:
+                raise RuntimeError(
+                    f"Workflow {workflow_id}: casa_script still contains unfilled "
+                    f"placeholders after safety substitution: {bad} — "
+                    "refusing to pass to CASA"
+                )
+            await self._run_casa_job(workflow_id, stage.value, script)
             if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
                 return
 
@@ -1607,21 +1632,44 @@ class Orchestrator:
 
         Fills VIS, CAL_FIELDS, ALL_SPW, CORRSTRING — the same derivation used
         by _build_solve_script — so the LLM cannot misidentify target fields.
+
+        Raises RuntimeError if required tool outputs are missing or yield no
+        calibrator fields — callers must not proceed with an unfilled template.
         """
         outputs = self._load_all_tool_outputs(workflow_id)
 
-        fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
+        field_data = outputs.get("ms_field_list", {}).get("data", {})
+        if not field_data:
+            raise RuntimeError(
+                f"Workflow {workflow_id}: ms_field_list tool output not found — "
+                "cannot determine calibrator fields for PREFLAG script"
+            )
+
+        fields = field_data.get("fields", [])
         cal_ids = [
             str(f["field_id"])
             for f in fields
             if f.get("calibrator_role", {}).get("value")
             or f.get("calibrator_match", {}).get("value")
         ]
-        cal_fields = ",".join(cal_ids) if cal_ids else "0"
+        if not cal_ids:
+            raise RuntimeError(
+                f"Workflow {workflow_id}: no calibrator fields found in ms_field_list — "
+                "cannot build PREFLAG script (check Phase 1 tool outputs)"
+            )
+        cal_fields = ",".join(cal_ids)
 
-        n_spw = (
-            outputs.get("ms_spectral_window_list", {}).get("data", {}).get("n_spw", 16)
-        )
+        spw_data = outputs.get("ms_spectral_window_list", {}).get("data", {})
+        if not spw_data:
+            raise RuntimeError(
+                f"Workflow {workflow_id}: ms_spectral_window_list tool output not found — "
+                "cannot determine SPW range for PREFLAG script"
+            )
+        n_spw = spw_data.get("n_spw")
+        if not n_spw:
+            raise RuntimeError(
+                f"Workflow {workflow_id}: n_spw missing from ms_spectral_window_list"
+            )
         all_spw = f"0~{n_spw - 1}"
 
         corr_products = (
@@ -1629,17 +1677,37 @@ class Orchestrator:
             .get("data", {})
             .get("corr_products", [])
         )
+        if not corr_products:
+            raise RuntimeError(
+                f"Workflow {workflow_id}: ms_correlator_config tool output not found — "
+                "cannot determine correlation products for PREFLAG script"
+            )
         parallel = [c for c in corr_products if c in ("XX", "YY", "RR", "LL")]
-        corrstring = ",".join(parallel) if parallel else "XX,YY"
+        if not parallel:
+            raise RuntimeError(
+                f"Workflow {workflow_id}: no parallel-hand correlations found in "
+                f"ms_correlator_config (got {corr_products!r})"
+            )
+        corrstring = ",".join(parallel)
 
         wf = self.db.get_workflow(workflow_id)
-        return (
+        filled = (
             tmpl.replace("{VIS}", wf["ms_path"])
             .replace("{CAL_FIELDS}", cal_fields)
             .replace("{ALL_SPW}", all_spw)
             .replace("{CORRSTRING}", corrstring)
             .replace("{SPW_DISCARD_THRESHOLD}", str(_SPW_DISCARD_THRESHOLD))
         )
+
+        # Sanity check — no placeholders should remain after deterministic fill
+        import re as _re
+        remaining = _re.findall(r"\{[A-Z_]+\}", filled)
+        if remaining:
+            raise RuntimeError(
+                f"Workflow {workflow_id}: PREFLAG template has unfilled placeholders "
+                f"after substitution: {remaining}"
+            )
+        return filled
 
     def _build_solve_script(self, workflow_id: int) -> str:
         """Fill all CALIBRATION_SOLVE placeholders from Phase 1-3 tool outputs."""

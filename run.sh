@@ -63,9 +63,17 @@ elif [ -f /etc/cdi/nvidia.yaml ]; then
     GPU_ARGS+=(--device nvidia.com/gpu=all)
 elif nvidia-smi &>/dev/null; then
     # Native Linux — pass NVIDIA devices directly (works on Atomic OS without nvidia-ctk)
+    # Also bind-mount libcuda.so.1 from the host; the CUDA container image ships only a
+    # stub and the real driver library must come from the host when CDI/nvidia-ctk is absent.
     echo "  GPU mode: native Linux (direct device passthrough)"
     for dev in /dev/nvidia* /dev/nvidia-caps/nvidia-cap*; do
         [ -e "$dev" ] && GPU_ARGS+=(--device "$dev")
+    done
+    for lib in /usr/lib64/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so.1; do
+        if [ -f "$lib" ]; then
+            GPU_ARGS+=(-v "$lib":/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro)
+            break
+        fi
     done
 else
     # No GPU detected — CPU only
@@ -85,6 +93,7 @@ MODEL_MOUNT_ARGS=(-v "$MODEL_PATH":/models/model.gguf:ro,z)
 
 podman run -d \
     --name wildcat-test \
+    --security-opt label=disable \
     "${GPU_ARGS[@]+"${GPU_ARGS[@]}"}" \
     "${GPU_ENV[@]+"${GPU_ENV[@]}"}" \
     -e WILDCAT_MS_PATH="$CONTAINER_MS" \

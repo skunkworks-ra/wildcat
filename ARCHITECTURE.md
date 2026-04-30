@@ -281,7 +281,7 @@ helpers guard against this with `(x.get("value") or default)`, not `.get("value"
 
 ```
 Base: docker.io/nvidia/cuda:12.6.3-devel-ubuntu24.04
-llama.cpp flags: -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_CUDA_ARCHITECTURES=86
+llama.cpp flags: -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=OFF -DCMAKE_CUDA_ARCHITECTURES="61;75;86"
 ```
 
 `BUILD_SHARED_LIBS=OFF` — static binary resolves `libcuda.so.1` at runtime via CDI injection rather than link time.
