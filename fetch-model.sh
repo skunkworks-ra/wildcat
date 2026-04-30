@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# Default: Qwen3.5-4B instruct GGUF from unsloth on HuggingFace
-HF_REPO="${HF_REPO:-unsloth/Qwen3.5-4B-GGUF}"
-HF_FILE="${HF_FILE:-Qwen3.5-4B-UD-Q4_K_XL.gguf}"
+# Default: Gemma 4 E2B instruct GGUF from unsloth on HuggingFace
+HF_REPO="${HF_REPO:-unsloth/gemma-4-E2B-it-GGUF}"
+HF_FILE="${HF_FILE:-gemma-4-E2B-it-Q4_K_M.gguf}"
 CACHE_DIR="${MODEL_CACHE_DIR:-$HOME/.cache/wildcat/models}"
 MODEL_PATH="$CACHE_DIR/$HF_FILE"
 

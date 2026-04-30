@@ -12,7 +12,7 @@ ctx_size     = 32768
 n_gpu_layers = 99
 threads      = 8
 temp         = 0.0
-extra_args   = []  # add ["-hf", "google/gemma-3-4b-it-GGUF:gemma-3-4b-it-Q4_K_M.gguf"] if no local model
+extra_args   = []  # add ["-hf", "unsloth/gemma-4-E2B-it-GGUF:gemma-4-E2B-it-Q4_K_M.gguf"] if no local model
 
 [llm.ollama]
 base_url = "http://localhost:11434/v1"

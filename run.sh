@@ -3,12 +3,12 @@ set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 IMAGE=wildcat
-MS_PATH=/home/pjaganna/Data/measurement_sets/3C129_1.ms
-MS_INSPECT_SRC=/home/pjaganna/Software/data-analyst
-SKILLS_SRC=/home/pjaganna/Software/data-analyst/.claude/skills/radio-interferometry
+MS_PATH="${MS_PATH:-/var/home/pjaganna/Software/casa_sim/sim_vla_basic.ms}"
+MS_INSPECT_SRC=/home/pjaganna/Software/radio-analyst
+SKILLS_SRC=/home/pjaganna/Software/radio-analyst/.claude/skills/radio-interferometry
 OUTPUT_DIR=/home/pjaganna/Data/wildcat-output
 
-CONTAINER_MS=/data/ms/3C129_1.ms
+CONTAINER_MS="/data/ms/$(basename "$MS_PATH")"
 
 # Host-side port bindings — override if defaults conflict with other services
 PORT_MS_INSPECT="${PORT_MS_INSPECT:-8100}"    # → container :8000 (ms-inspect MCP)
