@@ -1801,7 +1801,10 @@ class Orchestrator:
         for f in fields:
             if f["field_id"] == flux_field_id:
                 raw = f.get("flux_standard", {}).get("value") or ""
-                return self._FLUX_STANDARD_MAP.get(raw, raw)
+                if raw:
+                    return self._FLUX_STANDARD_MAP.get(raw, raw)
+                # flux_standard absent from catalogue — safe default for VLA flux cals
+                return "Perley-Butler 2017"
         return "Perley-Butler 2017"
 
     # ── Deterministic CALIBRATION_APPLY ───────────────────────────────────
