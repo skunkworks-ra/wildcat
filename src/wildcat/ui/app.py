@@ -17,7 +17,7 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
@@ -72,8 +72,14 @@ def build_ui_app(
 
     @router.get("/start", response_class=HTMLResponse)
     async def start_page(request: Request) -> HTMLResponse:
-        """Waiting screen shown when autostart is not set."""
-        # Predict the next workflow_id from the current max (SQLite AUTOINCREMENT).
+        """Redirect to the latest active workflow, or show the waiting room."""
+        _terminal = {Stage.IDLE.value, Stage.STOPPED.value, Stage.ERROR.value}
+        active = db.conn.execute(
+            "SELECT id FROM workflow WHERE stage NOT IN (?, ?, ?) ORDER BY id DESC LIMIT 1",
+            tuple(_terminal),
+        ).fetchone()
+        if active:
+            return RedirectResponse(url=f"/pipeline/{active['id']}", status_code=302)
         row = db.conn.execute("SELECT MAX(id) AS max_id FROM workflow").fetchone()
         next_id = (row["max_id"] or 0) + 1
         already_started = start_event is not None and start_event.is_set()
