@@ -1,8 +1,7 @@
-"""MCP SSE client for the ms-inspect server.
+"""MCP streamable-http client for the ms-inspect server.
 
-ms-inspect serves over SSE transport:
-  GET  /sse          — event stream (MCP session)
-  POST /messages/    — send requests
+ms-inspect serves over streamable-http transport:
+  POST /mcp  — MCP session (mcp>=1.2 streamable-http)
 
 Uses the official mcp Python client so the protocol is handled natively.
 """
@@ -13,7 +12,7 @@ import json
 import logging
 
 from mcp import ClientSession
-from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 log = logging.getLogger(__name__)
 
@@ -46,18 +45,18 @@ _PHASE3_TOOLS = [
 
 
 class MSInspectClient:
-    """MCP SSE client wrapping ms-inspect.
+    """MCP streamable-http client wrapping ms-inspect.
 
-    Opens a fresh SSE session per call group. Each context manager entry
-    connects to /sse and negotiates the MCP session.
+    Opens a fresh session per call group. Each context manager entry
+    connects to /mcp and negotiates the MCP session.
     """
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
-        self._sse_url = f"{self.base_url}/sse"
+        self._mcp_url = f"{self.base_url}/mcp"
 
     async def list_tools(self) -> list[dict]:
-        async with sse_client(self._sse_url) as (read, write):
+        async with streamablehttp_client(self._mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.list_tools()
@@ -65,11 +64,10 @@ class MSInspectClient:
 
     async def call_tool(self, name: str, arguments: dict) -> dict:
         log.debug("Calling tool %s with %s", name, arguments)
-        async with sse_client(self._sse_url) as (read, write):
+        async with streamablehttp_client(self._mcp_url) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 result = await session.call_tool(name, arguments)
-                # Extract text content and parse JSON
                 if result.content:
                     text = (
                         result.content[0].text
@@ -103,7 +101,6 @@ class MSInspectClient:
     async def run_phase3(self, ms_path: str) -> dict[str, dict]:
         return await self._run_phase(_PHASE3_TOOLS, ms_path)
 
-    # Keep async context manager for compatibility with main.py
     async def __aenter__(self) -> MSInspectClient:
         return self
 

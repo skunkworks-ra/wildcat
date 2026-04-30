@@ -103,8 +103,8 @@ echo "  Container started: wildcat-test"
 step "Waiting for ms-inspect to be ready on :$PORT_MS_INSPECT"
 
 for i in $(seq 1 60); do
-    HTTP_CODE=$(curl -s --connect-timeout 2 --max-time 3 "http://localhost:$PORT_MS_INSPECT/sse" -w "%{http_code}" -o /dev/null 2>/dev/null || true)
-    if [ "$HTTP_CODE" = "200" ]; then
+    HTTP_CODE=$(curl -s --connect-timeout 2 --max-time 3 -X POST "http://localhost:$PORT_MS_INSPECT/mcp" -H "Content-Type: application/json" -d '{}' -w "%{http_code}" -o /dev/null 2>/dev/null || true)
+    if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "400" ] || [ "$HTTP_CODE" = "422" ]; then
         echo "  ms-inspect is up (attempt $i)"
         break
     fi
@@ -126,10 +126,10 @@ step "Available ms-inspect tools"
 podman exec wildcat-test python3 - <<'EOF'
 import asyncio
 from mcp import ClientSession
-from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 async def main():
-    async with sse_client("http://localhost:8000/sse") as (read, write):
+    async with streamablehttp_client("http://localhost:8000/mcp") as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
@@ -146,13 +146,13 @@ step "Smoke test: Phase 1 tools against $CONTAINER_MS"
 podman exec wildcat-test python3 - <<EOF
 import asyncio, json
 from mcp import ClientSession
-from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 TOOLS = """ms_observation_info ms_field_list ms_scan_list ms_scan_intent_summary ms_spectral_window_list ms_correlator_config""".split()
 MS = "$CONTAINER_MS"
 
 async def main():
-    async with sse_client("http://localhost:8000/sse") as (read, write):
+    async with streamablehttp_client("http://localhost:8000/mcp") as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             for tool in TOOLS:
@@ -173,10 +173,10 @@ step "Full output: ms_observation_info"
 podman exec wildcat-test python3 - <<EOF
 import asyncio, json
 from mcp import ClientSession
-from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 
 async def main():
-    async with sse_client("http://localhost:8000/sse") as (read, write):
+    async with streamablehttp_client("http://localhost:8000/mcp") as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             r = await session.call_tool("ms_observation_info", {"ms_path": "$CONTAINER_MS"})
