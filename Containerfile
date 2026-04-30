@@ -28,7 +28,7 @@ RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp /opt/llama.cpp
 RUN cmake -B /opt/llama.cpp/build -S /opt/llama.cpp \
         -DGGML_CUDA=ON \
         -DBUILD_SHARED_LIBS=OFF \
-        -DCMAKE_CUDA_ARCHITECTURES=86 \
+        -DCMAKE_CUDA_ARCHITECTURES="61;75;86" \
         -DCMAKE_BUILD_TYPE=Release \
     && cmake --build /opt/llama.cpp/build --target llama-server -j$(nproc) \
     && rm -rf /opt/llama.cpp/.git
