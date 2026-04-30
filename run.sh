@@ -81,7 +81,7 @@ step "Starting container"
 # Clean up any previous run
 podman rm -f wildcat-test 2>/dev/null || true
 
-MODEL_MOUNT_ARGS=(-v "$MODEL_PATH":/models/model.gguf:ro)
+MODEL_MOUNT_ARGS=(-v "$MODEL_PATH":/models/model.gguf:ro,z)
 
 podman run -d \
     --name wildcat-test \
@@ -89,10 +89,10 @@ podman run -d \
     "${GPU_ENV[@]+"${GPU_ENV[@]}"}" \
     -e WILDCAT_MS_PATH="$CONTAINER_MS" \
     -e WILDCAT_AUTOSTART=1 \
-    -v "$MS_INSPECT_SRC":/opt/ms-inspect:ro \
-    -v "$SKILLS_SRC":/skills/radio-interferometry:ro \
-    -v "$(dirname "$MS_PATH")":/data/ms:ro \
-    -v "$OUTPUT_DIR":/data \
+    -v "$MS_INSPECT_SRC":/opt/ms-inspect:ro,z \
+    -v "$SKILLS_SRC":/skills/radio-interferometry:ro,z \
+    -v "$(dirname "$MS_PATH")":/data/ms:ro,z \
+    -v "$OUTPUT_DIR":/data:z \
     "${MODEL_MOUNT_ARGS[@]+"${MODEL_MOUNT_ARGS[@]}"}" \
     -p "$PORT_MS_INSPECT":8000 -p "$PORT_LLAMA":8080 -p "$PORT_UI":8081 \
     "$IMAGE"
