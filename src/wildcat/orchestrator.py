@@ -640,9 +640,97 @@ metrics = {
 print('WILDCAT_METRICS: ' + json.dumps(metrics))
 """
 
+_TEMPLATE_IMAGING = """\
+# wildcat IMAGING_PIPELINE — first-pass continuum imaging
+# LLM: fill all {PLACEHOLDER} values from the context provided.
+# Do NOT modify sections marked [DETERMINISTIC].
+
+import json
+from casatasks import tclean, exportfits
+
+workdir        = '/data/jobs/{WORKFLOW_ID}'
+vis            = '{VIS}'                  # full MS path (CORRECTED_DATA column)
+target_field   = '{TARGET_FIELD}'        # CASA field selection string for science target(s)
+image_name     = workdir + '/target.image'
+imsize         = {IMSIZE}                # [npix, npix] — derive from primary beam / resolution
+cell           = '{CELL}'               # e.g. '2arcsec' — ~5 pixels per synthesised beam
+phasecenter    = '{PHASECENTER}'         # '' for single field; 'ICRS HH:MM:SS.s +/-DD.MM.SS.s' for mosaic
+gridder        = '{GRIDDER}'            # 'standard' (single field) or 'mosaic'
+wprojplanes    = {WPROJPLANES}           # 1 for standard; -1 for mosaic/wproject
+deconvolver    = 'hogbom'
+weighting      = 'briggs'
+robust         = 0.5
+niter          = {NITER}                 # start conservative: 1000–5000
+threshold      = '{THRESHOLD}'          # e.g. '0.5mJy' — ~3× expected RMS
+stokes         = '{STOKES}'             # 'I' default; 'IQUV' if polcal ran
+
+# [DETERMINISTIC] Run tclean
+tclean(
+    vis=vis,
+    imagename=image_name,
+    field=target_field,
+    spw='',
+    imsize=imsize,
+    cell=cell,
+    phasecenter=phasecenter,
+    gridder=gridder,
+    wprojplanes=wprojplanes,
+    deconvolver=deconvolver,
+    weighting=weighting,
+    robust=robust,
+    niter=niter,
+    threshold=threshold,
+    stokes=stokes,
+    pbcor=True,
+    savemodel='none',
+)
+
+# [DETERMINISTIC] Export to FITS for archiving
+exportfits(imagename=image_name + '.pbcor', fitsimage=image_name + '.pbcor.fits', overwrite=True)
+
+# [DETERMINISTIC] Emit image paths for ms_image_stats
+metrics = {
+    'stage':      'IMAGING_PIPELINE',
+    'image_path': image_name + '.image',
+    'pbcor_path': image_name + '.pbcor',
+    'psf_path':   image_name + '.psf',
+    'fits_path':  image_name + '.pbcor.fits',
+}
+print('WILDCAT_METRICS: ' + json.dumps(metrics))
+"""
+
+# Instruction for IMAGING_PIPELINE — small-model friendly: key params only
+_JSON_INSTRUCTION_IMAGING = """
+The Phase 1-3 tool outputs are provided. Fill the tclean template placeholders.
+Respond with a single JSON object and no other text:
+{
+  "next_stage": "IMAGING_PIPELINE",
+  "casa_script": "<completed python script — fill ALL {PLACEHOLDER} values>",
+  "summary": "<1-3 sentences: what you imaged, key parameter choices>",
+  "reasoning": "<brief trace>"
+}
+
+Parameter derivation rules (apply in order, no extra reasoning needed):
+- VIS: the full ms_path from context
+- TARGET_FIELD: field IDs where intent contains TARGET or OBSERVE — comma-separated
+- IMSIZE: [round(1.5 * primary_beam_px / cell_px) to nearest 100, same] where
+    primary_beam_deg = 45.0 / (dish_m * freq_ghz),
+    synth_beam_arcsec = 206265 * lambda_m / max_baseline_m,
+    cell_arcsec = synth_beam_arcsec / 5,
+    primary_beam_px = primary_beam_deg * 3600 / cell_arcsec
+- CELL: "{cell_arcsec:.1f}arcsec"
+- PHASECENTER: '' for single pointing; 'ICRS {ra} {dec}' of mosaic centre for multiple
+- GRIDDER: 'mosaic' if multiple target pointings else 'standard'
+- WPROJPLANES: -1 if mosaic else 1
+- NITER: 3000
+- THRESHOLD: '0.5mJy'
+- STOKES: 'IQUV' if polcal ran (workflow_config polcal=true) else 'I'
+"""
+
 _TEMPLATES_BY_STAGE: dict[Stage, str] = {
     Stage.CALIBRATION_PREFLAG: _TEMPLATE_PREFLAG,
     Stage.POLCAL_SOLVE: _TEMPLATE_POLCAL,
+    Stage.IMAGING_PIPELINE: _TEMPLATE_IMAGING,
 }
 
 # Valid next_stage values per calibration stage (LLM-driven stages only)
@@ -855,11 +943,10 @@ class Orchestrator:
                     self.db.transition(workflow_id, Stage.CALIBRATION_PREFLAG)
 
                 elif stage == Stage.IMAGING_PIPELINE:
-                    log.info(
-                        "Workflow %d reached IMAGING_PIPELINE — handoff complete",
-                        workflow_id,
-                    )
-                    break
+                    await self._handle_imaging_stage(workflow_id)
+
+                elif stage == Stage.IMAGING_CHECKPOINT:
+                    await self._handle_checkpoint(workflow_id)
 
                 elif stage == Stage.STOPPED:
                     log.info("Workflow %d stopped by user request", workflow_id)
@@ -1459,6 +1546,52 @@ class Orchestrator:
         "Stevens-Reynolds-2016": "Stevens-Reynolds 2016",
     }
 
+    async def _generate_calsol_plots(self, workflow_id: int) -> None:
+        """Call ms_calsol_plot_library for delay/bandpass/gain caltables.
+
+        Runs after CALIBRATION_APPLY so plots are ready at the checkpoint.
+        Failures are logged but do not abort the workflow.
+        """
+        metrics = self.db.get_last_job_metrics(
+            workflow_id, Stage.CALIBRATION_SOLVE.value
+        )
+        workdir = f"/data/jobs/{workflow_id}"
+        caltable_paths = [
+            p for p in [
+                metrics.get("t_delay", f"{workdir}/delay.cal"),
+                metrics.get("t_bp",    f"{workdir}/bandpass.cal"),
+                metrics.get("t_gain",  f"{workdir}/gain.cal"),
+            ]
+            if p
+        ]
+        if not caltable_paths:
+            log.warning("Workflow %d: no caltable paths in metrics — skipping plots", workflow_id)
+            return
+
+        try:
+            result = await self.tools.call_tool(
+                "ms_plot_caltable_library",
+                {"params": {"caltable_paths": caltable_paths, "output_dir": workdir}},
+            )
+            plots_list = result.get("data", {}).get("plots", {}).get("value", []) if isinstance(result, dict) else []
+            html_paths = [p["html_path"] for p in plots_list if p.get("status") == "ok" and p.get("html_path")]
+            if html_paths:
+                # Store plot paths in the most recent job row for the UI
+                job_row = self.db.conn.execute(
+                    "SELECT id FROM jobs WHERE workflow_id = ? AND stage = ?"
+                    " ORDER BY completed_at DESC LIMIT 1",
+                    (workflow_id, Stage.CALIBRATION_APPLY.value),
+                ).fetchone()
+                if job_row:
+                    self.db.conn.execute(
+                        "UPDATE jobs SET plots = ? WHERE id = ?",
+                        (json.dumps(html_paths), job_row["id"]),
+                    )
+                    self.db.conn.commit()
+            log.info("Workflow %d: calsol plots generated: %s", workflow_id, html_paths)
+        except Exception as exc:
+            log.warning("Workflow %d: ms_calsol_plot_library failed: %s", workflow_id, exc)
+
     async def _run_calsol_stats(self, caltable_path: str) -> dict:
         """Call ms_calsol_stats via MCP on a single caltable. Returns {} on failure."""
         try:
@@ -1618,6 +1751,9 @@ class Orchestrator:
         if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
             return
 
+        # Generate calsol plots for all three caltables in parallel
+        await self._generate_calsol_plots(workflow_id)
+
         # Read metrics from both stages for the LLM summary
         apply_metrics = self.db.get_last_job_metrics(
             workflow_id, Stage.CALIBRATION_APPLY.value
@@ -1656,6 +1792,106 @@ class Orchestrator:
             self.db.transition(workflow_id, Stage.IMAGING_PIPELINE)
         else:
             self.db.transition(workflow_id, Stage.CALIBRATION_CHECKPOINT)
+
+    async def _handle_imaging_stage(self, workflow_id: int) -> None:
+        """IMAGING_PIPELINE: LLM fills tclean template, CASA runs, ms_image_stats called.
+
+        Context is assembled deterministically from Phase 1-3 tool outputs so the
+        small model only needs to derive tclean parameters — it doesn't query tools.
+        """
+        if self.stop_event.is_set():
+            self.db.transition(workflow_id, Stage.STOPPED)
+            return
+
+        wf = self.db.get_workflow(workflow_id)
+        wf_config = self.db.get_workflow_config(workflow_id)
+        outputs = self._load_all_tool_outputs(workflow_id)
+
+        # Derive key observing parameters for the LLM
+        obs = outputs.get("ms_observation_info", {}).get("data", {})
+        ants = outputs.get("ms_antenna_list", {}).get("data", {})
+        baselines = outputs.get("ms_baseline_lengths", {}).get("data", {})
+        spws = outputs.get("ms_spectral_window_list", {}).get("data", {})
+        fields = outputs.get("ms_field_list", {}).get("data", {}).get("fields", [])
+
+        target_fields = [
+            f for f in fields
+            if not (f.get("calibrator_role", {}).get("value") or f.get("calibrator_match", {}).get("value"))
+        ]
+
+        user_content = "\n".join([
+            "## IMAGING_PIPELINE — fill the tclean template",
+            f"MS path: {wf['ms_path']}",
+            f"Workflow config: {json.dumps(wf_config)}",
+            "",
+            "## Observing summary",
+            f"Telescope: {obs.get('telescope_name', {}).get('value', 'unknown')}",
+            f"Centre freq (Hz): {obs.get('centre_frequency_hz', {}).get('value', 'unknown')}",
+            f"Bandwidth (Hz): {spws.get('total_bandwidth_hz', {}).get('value', 'unknown')}",
+            f"Max baseline (m): {baselines.get('max_baseline_m', {}).get('value', 'unknown')}",
+            f"Dish diameter (m): {ants.get('dish_diameter_m', {}).get('value', 'unknown')}",
+            f"N antennas: {ants.get('n_antennas', {}).get('value', 'unknown')}",
+            "",
+            "## Target fields",
+            "```json",
+            json.dumps([{
+                "field_id": f.get("field_id", {}).get("value"),
+                "name": f.get("name", {}).get("value"),
+                "ra_deg": f.get("ra_deg", {}).get("value"),
+                "dec_deg": f.get("dec_deg", {}).get("value"),
+            } for f in target_fields], indent=2),
+            "```",
+        ])
+
+        system_prompt = load_system_prompt(self.skills_path, Stage.IMAGING_PIPELINE)
+        messages = [
+            {"role": "system", "content": system_prompt + "\n\n" + _JSON_INSTRUCTION_IMAGING},
+            {"role": "user", "content": user_content},
+        ]
+
+        decision, _model = await self._llm_call_with_retry_and_tools(
+            workflow_id, Stage.IMAGING_PIPELINE, messages
+        )
+        if decision is None:
+            return
+
+        casa_script = decision.get("casa_script") or ""
+        if not casa_script.strip():
+            log.error("Workflow %d: IMAGING_PIPELINE LLM returned no casa_script", workflow_id)
+            self.db.transition(workflow_id, Stage.ERROR)
+            return
+
+        await self._run_casa_job(workflow_id, Stage.IMAGING_PIPELINE.value, casa_script)
+        if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
+            return
+
+        # Call ms_image_stats on the pbcor image
+        img_metrics = self.db.get_last_job_metrics(workflow_id, Stage.IMAGING_PIPELINE.value)
+        pbcor_path = img_metrics.get("pbcor_path", "")
+        psf_path = img_metrics.get("psf_path", "")
+        if pbcor_path:
+            try:
+                img_stats = await self.tools.call_tool(
+                    "ms_image_stats",
+                    {"params": {"image_path": pbcor_path, "psf_path": psf_path or None}},
+                )
+                log.info("Workflow %d: image stats: %s", workflow_id, img_stats)
+                # Store image stats as a plot entry so UI can display them
+                job_row = self.db.conn.execute(
+                    "SELECT id FROM jobs WHERE workflow_id = ? AND stage = ?"
+                    " ORDER BY completed_at DESC LIMIT 1",
+                    (workflow_id, Stage.IMAGING_PIPELINE.value),
+                ).fetchone()
+                if job_row:
+                    self.db.conn.execute(
+                        "UPDATE jobs SET plots = ? WHERE id = ?",
+                        (json.dumps({"image_stats": img_stats, "fits_path": img_metrics.get("fits_path", "")}), job_row["id"]),
+                    )
+                    self.db.conn.commit()
+            except Exception as exc:
+                log.warning("Workflow %d: ms_image_stats failed: %s", workflow_id, exc)
+
+        self.db.transition(workflow_id, Stage.IMAGING_CHECKPOINT)
 
     def _build_apply_script(self, workflow_id: int) -> str:
         """Fill all CALIBRATION_APPLY placeholders from Phase 1-3 tool outputs."""
