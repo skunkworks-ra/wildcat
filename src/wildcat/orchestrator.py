@@ -200,8 +200,8 @@ if not os.path.exists(vis):
 # [DETERMINISTIC] tfcrop + extend in a single list-mode pass (one MS read)
 # tfcrop is appropriate here — raw data lacks Gaussian statistics needed by rflag
 flag_cmds = [
-    "mode='tfcrop' field='" + cal_fields + "' spw='" + all_spw + "' correlation='ABS_" + corrstring + "' ntime='scan' combinescans=False datacolumn='data' timecutoff=4.0 freqcutoff=4.0 timefit='line' freqfit='poly' maxnpieces=7 flagdimension='freqtime' extendflags=False",
-    "mode='extend' field='" + cal_fields + "' spw='" + all_spw + "' growtime=50.0 growfreq=90.0",
+    f"mode='tfcrop' field='{cal_fields}' spw='{all_spw}' correlation='ABS_{corrstring}' ntime='scan' combinescans=False datacolumn='data' timecutoff=4.0 freqcutoff=4.0 timefit='line' freqfit='poly' maxnpieces=7 flagdimension='freqtime' extendflags=False",
+    f"mode='extend' field='{cal_fields}' spw='{all_spw}' growtime=50.0 growfreq=90.0",
 ]
 flagdata(
     vis=vis, mode='list',
@@ -411,8 +411,8 @@ applycal(
 
 # [DETERMINISTIC] rflag + extend on CORRECTED column in a single list-mode pass
 flag_cmds = [
-    "mode='rflag' field='" + cal_field + "' spw='" + all_spw + "' correlation='ABS_" + corrstring + "' ntime='scan' combinescans=False datacolumn='corrected' winsize=3 timedevscale=4.0 freqdevscale=4.0 extendflags=False",
-    "mode='extend' field='" + cal_field + "' spw='" + all_spw + "' growtime=50.0 growfreq=90.0",
+    f"mode='rflag' field='{cal_field}' spw='{all_spw}' correlation='ABS_{corrstring}' ntime='scan' combinescans=False datacolumn='corrected' winsize=3 timedevscale=4.0 freqdevscale=4.0 extendflags=False",
+    f"mode='extend' field='{cal_field}' spw='{all_spw}' growtime=50.0 growfreq=90.0",
 ]
 flagdata(
     vis=vis, mode='list',
