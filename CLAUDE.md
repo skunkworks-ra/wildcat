@@ -107,10 +107,10 @@ State lives entirely in SQLite. The LLM is stateless and invoked once per decisi
 
 ### LLM decision contract
 
-Every LLM response must be a JSON object. Required keys vary by stage but always include
-`next_stage` and `summary`. Optional: `casa_script`, `reasoning`, `checkpoint_questions`,
-`auto_proceed`. The orchestrator validates in `_parse_decision()` and enters ERROR on
-malformed output.
+Every LLM response must be a JSON object. `_DECISION_SCHEMA_KEYS` requires `next_stage`,
+`summary`, and `reasoning` from **every** stage — per-stage instructions must include all
+three. Optional: `casa_script`, `checkpoint_questions`, `auto_proceed`. The orchestrator
+validates in `_parse_decision()` and enters ERROR on malformed output.
 
 ### Internal tools (multi-turn tool-use stages)
 
@@ -161,6 +161,15 @@ temp        = 0.0
 Switch backends by changing `[llm] backend` — no code changes required.
 
 ## Known constraints and hard-won fixes
+
+### CALIBRATION_APPLY: missing next_stage/reasoning in LLM instruction (fixed)
+`_JSON_INSTRUCTION_APPLY` defined a schema without `next_stage` or `reasoning`, but
+`_DECISION_SCHEMA_KEYS` requires both from every stage. The LLM followed the instruction
+faithfully and returned `{auto_proceed, summary, checkpoint_questions}`, causing
+`_parse_decision()` to reject all 5 retries and enter ERROR. Fixed by adding `next_stage`
+(`IMAGING_PIPELINE` if `auto_proceed` else `CALIBRATION_CHECKPOINT`) and `reasoning` to
+the schema. **Rule:** every stage instruction must include `next_stage`, `summary`, and
+`reasoning` — verify this whenever adding a new stage.
 
 ### CALIBRATION_SOLVE context overflow on ms_calsol_stats (fixed)
 `ms_calsol_stats` on `bandpass.cal` returns a 27×8×64 per-channel `amp_array` (~515KB).
