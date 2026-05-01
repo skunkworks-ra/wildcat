@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from pathlib import Path
 
 from wildcat.llm import LLMBackend
@@ -1396,26 +1397,37 @@ class Orchestrator:
             return
 
         # 4. Run CASA script
-        if decision.get("casa_script"):
+        # For the first PREFLAG pass the template is fully deterministic — use it
+        # directly to avoid LLM-introduced mutations (e.g. trailing commas that
+        # turn list assignments into tuples).  Re-entries need the LLM's script
+        # because it adjusts flagging parameters.
+        if stage == Stage.CALIBRATION_PREFLAG and tmpl is not None and not is_reentry:
+            script = tmpl
+        elif decision.get("casa_script"):
+            script = decision["casa_script"]
+            if stage == Stage.CALIBRATION_PREFLAG and tmpl is not None:
+                script = self._prefill_preflag_template(workflow_id, script)
+            # Strip trailing commas that would turn list assignments into tuples,
+            # e.g.  flag_cmds = [...],  →  flag_cmds = [...]
+            script = re.sub(
+                r"(\bflag_cmds\s*=\s*\[(?:[^\[\]]*)\])\s*,",
+                r"\1",
+                script,
+                flags=re.DOTALL,
+            )
+        else:
+            script = None
+
+        if script is not None:
             if self.stop_event.is_set():
                 self.db.transition(workflow_id, Stage.STOPPED)
                 return
-            script = decision["casa_script"]
-            # Safety net: if the LLM rewrote the script using placeholder names instead
-            # of copying the pre-filled template, apply the same substitution.
-            if stage == Stage.CALIBRATION_PREFLAG and tmpl is not None:
-                script = self._prefill_preflag_template(workflow_id, script)
             # Hard-fail if any {PLACEHOLDER} patterns remain — do not pass to CASA.
-            import re as _re
-            remaining = _re.findall(r"\{[A-Z_a-z]+\}", script)
-            # Exclude Python dict/set literals: single-word tokens that look like
-            # variable names rather than template placeholders are fine, but we
-            # specifically check for the known placeholder names.
             _KNOWN_PLACEHOLDERS = {
                 "{CAL_FIELDS}", "{ALL_SPW}", "{CORRSTRING}",
                 "{VIS}", "{WORKFLOW_ID}", "{SPW_DISCARD_THRESHOLD}",
             }
-            bad = [p for p in remaining if p in _KNOWN_PLACEHOLDERS]
+            bad = [p for p in re.findall(r"\{[A-Z_a-z]+\}", script) if p in _KNOWN_PLACEHOLDERS]
             if bad:
                 raise RuntimeError(
                     f"Workflow {workflow_id}: casa_script still contains unfilled "
@@ -1834,8 +1846,7 @@ class Orchestrator:
         )
 
         # Sanity check — no placeholders should remain after deterministic fill
-        import re as _re
-        remaining = _re.findall(r"\{[A-Z_]+\}", filled)
+        remaining = re.findall(r"\{[A-Z_]+\}", filled)
         if remaining:
             raise RuntimeError(
                 f"Workflow {workflow_id}: PREFLAG template has unfilled placeholders "
