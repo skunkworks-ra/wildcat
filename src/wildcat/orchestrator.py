@@ -87,8 +87,10 @@ _JSON_INSTRUCTION_APPLY = """
 The CASA calibration script has already run. You are given the WILDCAT_METRICS output.
 Respond with a single JSON object and no other text. Schema:
 {
+  "next_stage": "<IMAGING_PIPELINE if auto_proceed else CALIBRATION_CHECKPOINT>",
   "auto_proceed": <true if all fractions < 0.20 and n_antennas_lost <= 1, else false>,
   "summary": "<2-5 sentences with actual metric values from WILDCAT_METRICS>",
+  "reasoning": "<brief trace explaining auto_proceed decision and severity>",
   "checkpoint_questions": [
     {
       "id": "calibration_done",
