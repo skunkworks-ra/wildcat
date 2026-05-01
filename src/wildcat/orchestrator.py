@@ -1675,7 +1675,8 @@ class Orchestrator:
         corr_products = (
             outputs.get("ms_correlator_config", {})
             .get("data", {})
-            .get("corr_products", [])
+            .get("correlation_products", {})
+            .get("value", [])
         )
         if not corr_products:
             raise RuntimeError(
