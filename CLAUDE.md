@@ -162,6 +162,23 @@ Switch backends by changing `[llm] backend` — no code changes required.
 
 ## Known constraints and hard-won fixes
 
+### IMAGING_PIPELINE: _handle_imaging_stage field schema mismatches (fixed)
+`ms_field_list` fields use plain scalars for `field_id` (int) and `name` (str) — not
+`{"value": ..., "flag": "..."}` wrappers. Coordinates are `ra_j2000_deg`/`dec_j2000_deg`,
+not `ra_deg`/`dec_deg`. Additionally `ms_antenna_list` stores `n_antennas` as a plain int
+and `dish_diameter_m` inside the per-antenna list (not top-level); `ms_spectral_window_list`
+has no `total_bandwidth_hz` or `centre_frequency_hz` — these must be derived by iterating
+`spectral_windows[*].total_bw_hz` and `spectral_windows[*].centre_freq_hz`.
+All were calling `.get('value')` on plain ints → `AttributeError`.
+
+### Checkpoint submit button stays disabled when there are no questions (fixed)
+`checkpoint_panel.html` starts the submit button as `disabled` and only re-evaluates it
+inside `cpSelect()`. When there are no `checkpoint_questions` (e.g. cap-escalated
+CALIBRATION_CHECKPOINT), `cpSelect()` is never called and the button stays permanently
+disabled. Fixed by initialising the button state on load:
+`document.getElementById('cp-submit').disabled = !questionIds.every(id => answered[id]);`
+(`[].every(...)` is vacuously true, so an empty question list enables the button immediately.)
+
 ### LLM script sanitizer: _sanitize_llm_script() (fixed)
 All LLM-generated CASA scripts pass through `_sanitize_llm_script()` before execution.
 Currently covers one pattern:
