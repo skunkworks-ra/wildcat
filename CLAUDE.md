@@ -162,14 +162,21 @@ Switch backends by changing `[llm] backend` — no code changes required.
 
 ## Known constraints and hard-won fixes
 
-### CALIBRATION_PREFLAG: LLM trailing comma turns flag_cmds into a tuple (fixed)
-The LLM was adding a trailing comma when copying the pre-filled template back:
-`flag_cmds = [...],` — Python treats this as a tuple, causing CASA `flagdata` to
-reject `inpfile` with `AssertionError: {'inpfile': ['must be of cStr type']}`.
+### LLM script sanitizer: _sanitize_llm_script() (fixed)
+All LLM-generated CASA scripts pass through `_sanitize_llm_script()` before execution.
+Currently covers one pattern:
+- Trailing comma after list assignments (`flag_cmds = [...],` → `flag_cmds = [...]`)
+  that would turn the list into a tuple — CASA `flagdata` rejects with
+  `AssertionError: {'inpfile': ['must be of cStr type']}`.
+  Regex handles one level of nested brackets.
 
-Fix: on the first pass (`not is_reentry`) the orchestrator uses `tmpl` directly
-and ignores `decision["casa_script"]`. For re-entries a regex sanitizer strips
-`flag_cmds = [...],` → `flag_cmds = [...]` before the script reaches CASA.
+Applied at: PREFLAG re-entry scripts, POLCAL_SOLVE scripts, CALIBRATION_SOLVE retry scripts.
+On the first PREFLAG pass the template is used directly (not the LLM's copy) so sanitization is not needed.
+
+### CALIBRATION_PREFLAG cap off-by-one (fixed)
+The cap guard used `> _PREFLAG_MAX_ITERATIONS` instead of `>=`. At the final allowed iteration
+the LLM was called anyway and invented invalid `next_stage` values like `"escalate"`, causing
+ERROR state. Fixed to `>=`.
 
 ### CALIBRATION_APPLY: missing next_stage/reasoning in LLM instruction (fixed)
 `_JSON_INSTRUCTION_APPLY` defined a schema without `next_stage` or `reasoning`, but
@@ -200,6 +207,15 @@ service. Use `curl -4`.
 ### SSH port forwarding
 `LocalForward 8181 127.0.0.1:8181` — must use `127.0.0.1`, not `localhost`. Same IPv4/IPv6
 issue as above.
+
+### pol_cal_feasibility: leakage cal fallback when primary fails PA threshold (fixed)
+When the identified leakage calibrator has marginal PA spread (<threshold), `pol_cal_feasibility.py`
+now searches all other multi-scan non-target, non-angle-cal fields as alternative candidates.
+The field with the best PA spread that meets the threshold is promoted as the leakage cal with a
+warning. All candidates and their spreads are reported in `leakage_cal_alternatives` for LLM context.
+If no fallback meets the threshold all candidates are still listed — the LLM can reason about the
+best available option. `available` in the output now reflects whether a usable field was found
+(not just catalogue presence), so a fallback-promoted field correctly shows `available: true`.
 
 ### Calibrator lookup fails for CASA "=" naming convention (fixed)
 CASA names calibrators as `"B1950=CommonName"` (e.g. `"0137+331=3C48"`). `_normalise()` in
