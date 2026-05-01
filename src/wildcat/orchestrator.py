@@ -180,7 +180,7 @@ _QUESTION_CONFIG_MAP: dict[str, dict[str, tuple[str, object] | None]] = {
 
 _TEMPLATE_PREFLAG = """\
 # wildcat CALIBRATION_PREFLAG — split calibrators, tfcrop, report flag fractions
-# LLM: fill all {PLACEHOLDER} values from Phase 1-3 tool outputs
+# All values filled deterministically by the orchestrator from Phase 1-3 tool outputs.
 
 import json, os
 from casatasks import split, flagdata
