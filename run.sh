@@ -204,7 +204,7 @@ while true; do
     i=$((i + 1))
     STAGE=$(python3 -c "
 import sqlite3
-con = sqlite3.connect('/home/pjaganna/Data/wildcat-output/wildcat.db')
+con = sqlite3.connect('$OUTPUT_DIR/wildcat.db')
 row = con.execute('SELECT stage FROM workflow ORDER BY id DESC LIMIT 1').fetchone()
 print(row[0] if row else 'NONE')
 " 2>/dev/null)
@@ -213,7 +213,7 @@ print(row[0] if row else 'NONE')
         CALIBRATION_CHECKPOINT|HUMAN_CHECKPOINT|IMAGING_PIPELINE|STOPPED|ERROR)
             HAS_CP=$(python3 -c "
 import sqlite3
-con = sqlite3.connect('/home/pjaganna/Data/wildcat-output/wildcat.db')
+con = sqlite3.connect('$OUTPUT_DIR/wildcat.db')
 row = con.execute('SELECT id FROM checkpoints ORDER BY id DESC LIMIT 1').fetchone()
 print(row[0] if row else 'none')
 " 2>/dev/null)
