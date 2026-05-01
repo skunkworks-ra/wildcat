@@ -112,8 +112,8 @@ echo "  Container started: wildcat-test"
 step "Waiting for ms-inspect to be ready on :$PORT_MS_INSPECT"
 
 for i in $(seq 1 60); do
-    HTTP_CODE=$(curl -s --connect-timeout 2 --max-time 3 -X POST "http://localhost:$PORT_MS_INSPECT/mcp" -H "Content-Type: application/json" -d '{}' -w "%{http_code}" -o /dev/null 2>/dev/null || true)
-    if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "400" ] || [ "$HTTP_CODE" = "422" ]; then
+    HTTP_CODE=$(curl -4 -s --connect-timeout 2 --max-time 3 -X POST "http://127.0.0.1:$PORT_MS_INSPECT/mcp" -H "Content-Type: application/json" -d '{}' -w "%{http_code}" -o /dev/null 2>/dev/null || true)
+    if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "400" ] || [ "$HTTP_CODE" = "406" ] || [ "$HTTP_CODE" = "422" ]; then
         echo "  ms-inspect is up (attempt $i)"
         break
     fi
