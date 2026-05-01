@@ -200,8 +200,8 @@ if not os.path.exists(vis):
 # [DETERMINISTIC] tfcrop + extend in a single list-mode pass (one MS read)
 # tfcrop is appropriate here — raw data lacks Gaussian statistics needed by rflag
 flag_cmds = [
-    f"mode='tfcrop' field='{cal_fields}' spw='{all_spw}' correlation='ABS_{corrstring}' ntime='scan' combinescans=False datacolumn='data' timecutoff=4.0 freqcutoff=4.0 timefit='line' freqfit='poly' maxnpieces=7 flagdimension='freqtime' extendflags=False",
-    f"mode='extend' field='{cal_fields}' spw='{all_spw}' growtime=50.0 growfreq=90.0",
+    "mode='tfcrop' field='{CAL_FIELDS}' spw='{ALL_SPW}' correlation='ABS_{CORRSTRING}' ntime='scan' combinescans=False datacolumn='data' timecutoff=4.0 freqcutoff=4.0 timefit='line' freqfit='poly' maxnpieces=7 flagdimension='freqtime' extendflags=False",
+    "mode='extend' field='{CAL_FIELDS}' spw='{ALL_SPW}' growtime=50.0 growfreq=90.0",
 ]
 flagdata(
     vis=vis, mode='list',
@@ -411,8 +411,8 @@ applycal(
 
 # [DETERMINISTIC] rflag + extend on CORRECTED column in a single list-mode pass
 flag_cmds = [
-    f"mode='rflag' field='{cal_field}' spw='{all_spw}' correlation='ABS_{corrstring}' ntime='scan' combinescans=False datacolumn='corrected' winsize=3 timedevscale=4.0 freqdevscale=4.0 extendflags=False",
-    f"mode='extend' field='{cal_field}' spw='{all_spw}' growtime=50.0 growfreq=90.0",
+    "mode='rflag' field='{CAL_FIELDS}' spw='{ALL_SPW}' correlation='ABS_{CORRSTRING}' ntime='scan' combinescans=False datacolumn='corrected' winsize=3 timedevscale=4.0 freqdevscale=4.0 extendflags=False",
+    "mode='extend' field='{CAL_FIELDS}' spw='{ALL_SPW}' growtime=50.0 growfreq=90.0",
 ]
 flagdata(
     vis=vis, mode='list',
@@ -1387,9 +1387,8 @@ class Orchestrator:
             # variable names rather than template placeholders are fine, but we
             # specifically check for the known placeholder names.
             _KNOWN_PLACEHOLDERS = {
-                "{CAL_FIELDS}", "{cal_fields}", "{ALL_SPW}", "{all_spw}",
-                "{CORRSTRING}", "{corrstring}", "{VIS}", "{WORKFLOW_ID}",
-                "{SPW_DISCARD_THRESHOLD}",
+                "{CAL_FIELDS}", "{ALL_SPW}", "{CORRSTRING}",
+                "{VIS}", "{WORKFLOW_ID}", "{SPW_DISCARD_THRESHOLD}",
             }
             bad = [p for p in remaining if p in _KNOWN_PLACEHOLDERS]
             if bad:
