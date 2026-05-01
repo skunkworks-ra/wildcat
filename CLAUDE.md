@@ -162,6 +162,15 @@ Switch backends by changing `[llm] backend` — no code changes required.
 
 ## Known constraints and hard-won fixes
 
+### CALIBRATION_PREFLAG: LLM trailing comma turns flag_cmds into a tuple (fixed)
+The LLM was adding a trailing comma when copying the pre-filled template back:
+`flag_cmds = [...],` — Python treats this as a tuple, causing CASA `flagdata` to
+reject `inpfile` with `AssertionError: {'inpfile': ['must be of cStr type']}`.
+
+Fix: on the first pass (`not is_reentry`) the orchestrator uses `tmpl` directly
+and ignores `decision["casa_script"]`. For re-entries a regex sanitizer strips
+`flag_cmds = [...],` → `flag_cmds = [...]` before the script reaches CASA.
+
 ### CALIBRATION_APPLY: missing next_stage/reasoning in LLM instruction (fixed)
 `_JSON_INSTRUCTION_APPLY` defined a schema without `next_stage` or `reasoning`, but
 `_DECISION_SCHEMA_KEYS` requires both from every stage. The LLM followed the instruction
