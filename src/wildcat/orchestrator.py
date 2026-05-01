@@ -1285,7 +1285,7 @@ class Orchestrator:
                     await self._run_casa_job(
                         workflow_id,
                         Stage.CALIBRATION_SOLVE.value,
-                        decision["casa_script"],
+                        self._sanitize_llm_script(decision["casa_script"]),
                     )
                     if self.db.get_workflow(workflow_id)["stage"] == Stage.ERROR.value:
                         return
@@ -1313,7 +1313,7 @@ class Orchestrator:
         # Enforce preflag iteration cap
         if (
             stage == Stage.CALIBRATION_PREFLAG
-            and preflag_iterations > _PREFLAG_MAX_ITERATIONS
+            and preflag_iterations >= _PREFLAG_MAX_ITERATIONS
         ):
             log.warning(
                 "CALIBRATION_PREFLAG hit cap (%d iterations) for workflow %d — escalating",
@@ -1407,14 +1407,7 @@ class Orchestrator:
             script = decision["casa_script"]
             if stage == Stage.CALIBRATION_PREFLAG and tmpl is not None:
                 script = self._prefill_preflag_template(workflow_id, script)
-            # Strip trailing commas that would turn list assignments into tuples,
-            # e.g.  flag_cmds = [...],  →  flag_cmds = [...]
-            script = re.sub(
-                r"(\bflag_cmds\s*=\s*\[(?:[^\[\]]*)\])\s*,",
-                r"\1",
-                script,
-                flags=re.DOTALL,
-            )
+            script = self._sanitize_llm_script(script)
         else:
             script = None
 
@@ -1771,6 +1764,22 @@ class Orchestrator:
                     out[metric] = s
 
         return out
+
+    @staticmethod
+    def _sanitize_llm_script(script: str) -> str:
+        """Remove common LLM-introduced Python syntax errors from generated CASA scripts.
+
+        Covers:
+        - Trailing commas after list assignments that create accidental tuples,
+          e.g.  flag_cmds = [...],  →  flag_cmds = [...]
+          The pattern handles list items that themselves contain brackets.
+        """
+        return re.sub(
+            r"(\bflag_cmds\s*=\s*\[(?:[^\[\]]|\[[^\[\]]*\])*\])\s*,",
+            r"\1",
+            script,
+            flags=re.DOTALL,
+        )
 
     def _prefill_preflag_template(self, workflow_id: int, tmpl: str) -> str:
         """Fill deterministic PREFLAG placeholders from stored tool outputs.
