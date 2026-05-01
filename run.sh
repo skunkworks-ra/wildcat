@@ -3,10 +3,10 @@ set -euo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 IMAGE=wildcat
-MS_PATH="${MS_PATH:-/var/home/pjaganna/Software/casa_sim/sim_vla_basic.ms}"
-MS_INSPECT_SRC=/home/pjaganna/Software/radio-analyst
-SKILLS_SRC=/home/pjaganna/Software/radio-analyst/.claude/skills/radio-interferometry
-OUTPUT_DIR=/home/pjaganna/Data/wildcat-output
+MS_PATH="${MS_PATH:-/home/krishna/work/data/TDRW0001_calibrated.ms}"
+MS_INSPECT_SRC=$HOME/src/skunkworks-ra/radio-analyst
+SKILLS_SRC=$MS_INSPECT_SRC/.claude/skills/radio-interferometry
+OUTPUT_DIR=/home/krishna/work/tests/wildcat/wildcat-output
 
 CONTAINER_MS="/data/ms/$(basename "$MS_PATH")"
 
