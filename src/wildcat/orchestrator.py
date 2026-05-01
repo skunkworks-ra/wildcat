@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 from pathlib import Path
 
 from wildcat.llm import LLMBackend
@@ -860,6 +861,28 @@ _INTERNAL_TOOLS_OPENAI = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_calsol_stats",
+            "description": (
+                "Get the full ms_calsol_stats output (including per-channel arrays) "
+                "for a caltable produced by CALIBRATION_SOLVE. "
+                "Use this when the summary in the prompt lacks detail needed for routing. "
+                "caltable is one of: 'delay.cal', 'bandpass.cal', 'gain.cal'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "caltable": {
+                        "type": "string",
+                        "description": "Caltable filename, e.g. 'bandpass.cal'",
+                    },
+                },
+                "required": ["caltable"],
+            },
+        },
+    },
 ]
 
 # Stages that use the multi-turn tool-use pattern (others keep single-turn)
@@ -1186,9 +1209,9 @@ class Orchestrator:
             t_bp = metrics.get("t_bp", "")
             t_gain = metrics.get("t_gain", "")
             delay_stats, bp_stats, gain_stats = await asyncio.gather(
-                self._run_calsol_stats(t_delay),
-                self._run_calsol_stats(t_bp),
-                self._run_calsol_stats(t_gain),
+                self._run_calsol_stats(workflow_id, t_delay),
+                self._run_calsol_stats(workflow_id, t_bp),
+                self._run_calsol_stats(workflow_id, t_gain),
             )
 
             band = self._get_band(workflow_id)
@@ -1484,6 +1507,14 @@ class Orchestrator:
         if tool_name == "get_workflow_config":
             return json.dumps(self.db.get_workflow_config(workflow_id), indent=2)
 
+        if tool_name == "get_calsol_stats":
+            caltable = args.get("caltable", "")
+            rows = self.db.get_tool_outputs(workflow_id, "calibration_solve")
+            for row in rows:
+                if row["tool_name"] == f"ms_calsol_stats:{caltable}":
+                    return row["output_json"]
+            return f'{{"error": "calsol_stats for {caltable!r} not found"}}'
+
         return f'{{"error": "unknown tool {tool_name}"}}'
 
     # ── LLM retry with tool use ───────────────────────────────────────────
@@ -1616,15 +1647,116 @@ class Orchestrator:
         except Exception as exc:
             log.warning("Workflow %d: ms_calsol_plot_library failed: %s", workflow_id, exc)
 
-    async def _run_calsol_stats(self, caltable_path: str) -> dict:
-        """Call ms_calsol_stats via MCP on a single caltable. Returns {} on failure."""
+    async def _run_calsol_stats(
+        self, workflow_id: int, caltable_path: str
+    ) -> dict:
+        """Call ms_calsol_stats via MCP on a single caltable.
+
+        Stores the full raw result in tool_outputs (phase="calibration_solve")
+        so the LLM can retrieve per-channel detail on demand. Returns a compact
+        summary dict for the initial prompt.
+        """
         try:
-            return await self.tools.call_tool(
+            raw = await self.tools.call_tool(
                 "ms_calsol_stats", {"params": {"caltable_path": caltable_path}}
             )
+            tool_name = f"ms_calsol_stats:{Path(caltable_path).name}"
+            self.db.save_tool_output(
+                workflow_id,
+                "calibration_solve",
+                tool_name,
+                json.dumps(raw),
+            )
+            return self._summarize_calsol_stats(raw)
         except Exception as exc:
             log.warning("ms_calsol_stats failed for %s: %s", caltable_path, exc)
             return {"error": str(exc)}
+
+    @staticmethod
+    def _summarize_calsol_stats(stats: dict) -> dict:
+        """Strip raw per-channel arrays from ms_calsol_stats output.
+
+        Replaces large nested arrays with scalar {min, max, mean} summaries
+        and compact per-antenna/per-SPW flag fraction dicts so the result fits
+        comfortably inside the LLM context window.
+        """
+        if "error" in stats or "data" not in stats:
+            return stats
+
+        data = stats["data"]
+
+        def val(key, default=None):
+            v = data.get(key, {})
+            return v.get("value", default) if isinstance(v, dict) else (v if v is not None else default)
+
+        def flat_stats(arr) -> dict | None:
+            nums: list[float] = []
+
+            def walk(x: object) -> None:
+                if isinstance(x, list):
+                    for item in x:
+                        walk(item)
+                elif isinstance(x, (int, float)) and not math.isnan(x):
+                    nums.append(float(x))
+
+            walk(arr)
+            if not nums:
+                return None
+            return {
+                "min": round(min(nums), 4),
+                "max": round(max(nums), 4),
+                "mean": round(sum(nums) / len(nums), 4),
+            }
+
+        ant_names: list[str] = val("ant_names", [])
+        spw_ids: list[int] = val("spw_ids", [])
+        flag_raw: list = val("flagged_frac", [])  # shape [n_ant, n_spw, n_field]
+
+        per_spw_flag: dict[str, float | None] = {}
+        per_ant_flag: dict[str, float | None] = {}
+        if flag_raw:
+            n_ant = len(flag_raw)
+            n_spw = len(flag_raw[0]) if flag_raw else 0
+            for si, spw in enumerate(spw_ids):
+                spw_vals = [
+                    flag_raw[ai][si][0]
+                    for ai in range(n_ant)
+                    if si < len(flag_raw[ai]) and flag_raw[ai][si]
+                ]
+                per_spw_flag[str(spw)] = round(sum(spw_vals) / len(spw_vals), 3) if spw_vals else None
+            for ai, ant in enumerate(ant_names):
+                if ai < n_ant:
+                    ant_vals = [
+                        flag_raw[ai][si][0]
+                        for si in range(n_spw)
+                        if si < len(flag_raw[ai]) and flag_raw[ai][si]
+                    ]
+                    per_ant_flag[ant] = round(sum(ant_vals) / len(ant_vals), 3) if ant_vals else None
+
+        out: dict = {
+            "table_type": val("table_type"),
+            "n_antennas": val("n_antennas"),
+            "n_spw": val("n_spw"),
+            "overall_flagged_frac": val("overall_flagged_frac"),
+            "n_antennas_lost": val("n_antennas_lost"),
+            "antennas_lost": val("antennas_lost", []),
+            "per_spw_flagged_frac": per_spw_flag,
+            "per_ant_flagged_frac": per_ant_flag,
+            "outliers": val("outliers", {}),
+        }
+
+        table_type = out["table_type"]
+        if table_type == "K":
+            if s := flat_stats(val("delay_ns")):
+                out["delay_ns"] = s
+            if s := flat_stats(val("delay_rms_ns")):
+                out["delay_rms_ns"] = s
+        else:
+            for metric in ("amp_mean", "amp_std", "phase_mean_deg", "phase_rms_deg", "snr_mean"):
+                if s := flat_stats(val(metric)):
+                    out[metric] = s
+
+        return out
 
     def _prefill_preflag_template(self, workflow_id: int, tmpl: str) -> str:
         """Fill deterministic PREFLAG placeholders from stored tool outputs.
