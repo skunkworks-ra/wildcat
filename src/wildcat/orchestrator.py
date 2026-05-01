@@ -2077,10 +2077,10 @@ class Orchestrator:
             "## Target fields",
             "```json",
             json.dumps([{
-                "field_id": f.get("field_id", {}).get("value"),
-                "name": f.get("name", {}).get("value"),
-                "ra_deg": f.get("ra_deg", {}).get("value"),
-                "dec_deg": f.get("dec_deg", {}).get("value"),
+                "field_id": f.get("field_id"),
+                "name": f.get("name"),
+                "ra_deg": f.get("ra_j2000_deg", {}).get("value"),
+                "dec_deg": f.get("dec_j2000_deg", {}).get("value"),
             } for f in target_fields], indent=2),
             "```",
         ])
