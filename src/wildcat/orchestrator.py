@@ -2044,6 +2044,23 @@ class Orchestrator:
             if not (f.get("calibrator_role", {}).get("value") or f.get("calibrator_match", {}).get("value"))
         ]
 
+        # Derive centre freq and total bandwidth from the SPW list
+        _spw_list = spws.get("spectral_windows", [])
+        _centre_freqs = [
+            s["centre_freq_hz"]["value"]
+            for s in _spw_list
+            if isinstance(s.get("centre_freq_hz"), dict)
+        ]
+        _centre_freq = round(sum(_centre_freqs) / len(_centre_freqs)) if _centre_freqs else "unknown"
+        _total_bw = sum(
+            s["total_bw_hz"]["value"]
+            for s in _spw_list
+            if isinstance(s.get("total_bw_hz"), dict)
+        )
+        # dish_diameter_m lives inside the per-antenna list, not at top level
+        _first_ant = (ants.get("antennas") or [{}])[0]
+        _dish_m = _first_ant.get("diameter_m", {}).get("value", "unknown") if isinstance(_first_ant.get("diameter_m"), dict) else _first_ant.get("diameter_m", "unknown")
+
         user_content = "\n".join([
             "## IMAGING_PIPELINE — fill the tclean template",
             f"MS path: {wf['ms_path']}",
@@ -2051,11 +2068,11 @@ class Orchestrator:
             "",
             "## Observing summary",
             f"Telescope: {obs.get('telescope_name', {}).get('value', 'unknown')}",
-            f"Centre freq (Hz): {obs.get('centre_frequency_hz', {}).get('value', 'unknown')}",
-            f"Bandwidth (Hz): {spws.get('total_bandwidth_hz', {}).get('value', 'unknown')}",
+            f"Centre freq (Hz): {_centre_freq}",
+            f"Bandwidth (Hz): {_total_bw}",
             f"Max baseline (m): {baselines.get('max_baseline_m', {}).get('value', 'unknown')}",
-            f"Dish diameter (m): {ants.get('dish_diameter_m', {}).get('value', 'unknown')}",
-            f"N antennas: {ants.get('n_antennas', {}).get('value', 'unknown')}",
+            f"Dish diameter (m): {_dish_m}",
+            f"N antennas: {ants.get('n_antennas', 'unknown')}",
             "",
             "## Target fields",
             "```json",

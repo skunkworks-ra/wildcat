@@ -149,6 +149,9 @@
   const questionIds = {{ checkpoint_questions | map(attribute='id') | list | tojson | safe }};
   const answered = {};
 
+  // Enable immediately when there are no questions to answer
+  document.getElementById('cp-submit').disabled = !questionIds.every(id => answered[id]);
+
   window.cpSelect = function(btn) {
     const qid = btn.dataset.qid;
     document.querySelectorAll('.opt-btn[data-qid="' + qid + '"]').forEach(b => b.classList.remove('selected'));
